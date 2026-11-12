@@ -80,7 +80,7 @@ Opens or creates one SQLite file and returns a `MemoryBank`.
 
 Sends the text to the extractor, then stores the original text as a source document (split into chunks when it is long) plus up to five facts.
 
-Each fact is `world` (about other people or things) or `experience` (the agent's own action, written in first person by the extractor). `mentionedAt` is when the text was said. It defaults to now. `occurrenceTime` is when the event happened, and it is null when the text does not say.
+Each fact is `world` (about other people or things) or `experience` (the agent's own action, written in first person by the extractor). `mentionedAt` is when the text was said. It defaults to now. `occurrenceTime` is when the event actually happened, and only when the source text names that occurrence. Preferences, standing facts, and undated statements leave it null. A missing occurrence is never filled with the current clock or with `mentionedAt`.
 
 Returns `{ sourceId, facts }`.
 

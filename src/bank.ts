@@ -62,7 +62,7 @@ export class MemoryBank {
         saveFact(this.db, this.bankId, {
           text: fact.text,
           kind: fact.kind,
-          occurrenceTime: fact.occurrenceTime,
+          occurrenceTime: occurrenceFromSource(content, fact.occurrenceTime),
           mentionedAt,
           sourceId,
           mentions: fact.entities,
@@ -141,6 +141,37 @@ function requiredText(value: string, label: string): string {
     throw new MemoryBankError(`${label} must be a non-empty string.`);
   }
   return value;
+}
+
+const WEEKDAY =
+  /\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/i;
+const MONTH_THEN_DAY =
+  /\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\.?\s+\d{1,2}(?:st|nd|rd|th)?\b/i;
+const DAY_THEN_MONTH =
+  /\b\d{1,2}(?:st|nd|rd|th)?\s+(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b/i;
+const ISO_DATE = /\b\d{4}-\d{2}-\d{2}(?!\d)/;
+const NUMERIC_DATE = /\b\d{1,2}\/\d{1,2}(?:\/\d{2,4})?(?!\d)|\b\d{1,2}-\d{1,2}-\d{4}\b/;
+const ORDINAL_DAY = /\b(?:on|the)\s+\d{1,2}(?:st|nd|rd|th)\b/i;
+const RELATIVE_DAY =
+  /\b(?:yesterday|today|tomorrow|tonight)\b|\bago\b|\b(?:this|last|next)\s+(?:morning|afternoon|evening|night|week|month|year|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/i;
+
+/** A clock time or a preference is not an occurrence. Missing stays null, never "now". */
+function occurrenceFromSource(content: string, extracted: string | null): string | null {
+  if (extracted == null) return null;
+  if (!sourceNamesOccurrence(content)) return null;
+  return extracted;
+}
+
+function sourceNamesOccurrence(text: string): boolean {
+  return (
+    WEEKDAY.test(text) ||
+    MONTH_THEN_DAY.test(text) ||
+    DAY_THEN_MONTH.test(text) ||
+    ISO_DATE.test(text) ||
+    NUMERIC_DATE.test(text) ||
+    ORDINAL_DAY.test(text) ||
+    RELATIVE_DAY.test(text)
+  );
 }
 
 function toIso(value: string | Date | null | undefined, fallback: "now" | "null"): string {
