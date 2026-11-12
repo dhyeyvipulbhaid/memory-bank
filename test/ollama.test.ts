@@ -132,6 +132,40 @@ test("a non-JSON ollama body fails the retain and writes nothing", async () => {
   bank.close();
 });
 
+test("the extract prompt asks for occurrenceTime only on a real occurrence", async () => {
+  let system = "";
+  let user = "";
+  const fetchImpl = async (_url: string | URL | Request, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body)) as {
+      messages: Array<{ role: string; content: string }>;
+    };
+    system = body.messages.find((message) => message.role === "system")?.content ?? "";
+    user = body.messages.find((message) => message.role === "user")?.content ?? "";
+    return new Response(
+      JSON.stringify({ message: { role: "assistant", content: factJson } }),
+      { status: 200 },
+    );
+  };
+  const bank = openBank(dbPath(), {
+    extractor: createOllamaExtractor({ fetchImpl }),
+  });
+  await bank.retain({
+    content: "You: Can we move the standup? Maya: Let's do mornings, 9am works for me.",
+    mentionedAt: "2026-11-12T22:15:00.000Z",
+  });
+
+  expect(system).toContain("specific past or scheduled occurrence");
+  expect(system).toContain("Omit occurrenceTime");
+  expect(system).toContain("preferences");
+  expect(system).toContain("undated");
+  expect(system).toContain('Never use "now"');
+  expect(system).toContain("current clock");
+  expect(system).not.toContain("unless the event is that moment");
+  expect(user).toContain("not when an event happened");
+  expect(user).toContain("mentioned_at: 2026-11-12T22:15:00.000Z");
+  bank.close();
+});
+
 test("an http error from ollama does not write", async () => {
   const path = dbPath();
   const fetchImpl = async (): Promise<Response> => new Response("busy", { status: 503 });
