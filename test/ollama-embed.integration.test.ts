@@ -39,6 +39,14 @@ test.skipIf(process.env.MEMORY_BANK_OLLAMA_TEST !== "1")(
     });
     expect(semantic.facts[0]?.text).toBe(CANINE);
     expect(semantic.facts[0]?.score).toBeGreaterThan(0);
+
+    const hybrid = await bank.hybridRecall({
+      query: PARAPHRASE,
+      tokenBudget: 400,
+    });
+    expect(hybrid.facts[0]?.text).toBe(CANINE);
+    expect(hybrid.facts[0]?.breakdown.vector).toBeGreaterThan(0);
+    expect(hybrid.facts[0]?.breakdown.keyword).toBe(0);
     bank.close();
   },
 );

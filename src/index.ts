@@ -8,6 +8,8 @@ export {
 } from "./errors.ts";
 export { createBruteForceCosineRanker, createFakeEmbedder, type FakeEmbed } from "./embed.ts";
 export { createOllamaEmbedder, type OllamaEmbedderOptions } from "./embed.ts";
+export { DEFAULT_HALF_LIFE_DAYS, DEFAULT_HYBRID_WEIGHTS, DEFAULT_RRF_K } from "./hybrid.ts";
+export { createOllamaReranker, type OllamaRerankerOptions } from "./rerank.ts";
 export { createFakeExtractor, type FakeScript } from "./extract/fake.ts";
 export {
   createOllamaExtractor,
@@ -25,13 +27,20 @@ export type {
   Extractor,
   FactKind,
   FactRecord,
+  HybridFact,
+  HybridRecallInput,
+  HybridRecallResult,
+  HybridWeights,
   OpenBankOptions,
   RecalledFact,
   RecallInput,
   RecallResult,
   RememberInput,
+  Reranker,
+  RerankInput,
   RetainInput,
   RetainResult,
+  ScoreBreakdown,
   SemanticSearchInput,
   VectorHit,
   VectorPoint,

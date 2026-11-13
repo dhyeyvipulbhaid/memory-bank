@@ -54,6 +54,21 @@ export interface VectorRanker {
   rank(query: Float32Array, points: readonly VectorPoint[]): VectorHit[];
 }
 
+export interface RerankFact {
+  id: string;
+  text: string;
+}
+
+export interface RerankInput {
+  query: string;
+  facts: readonly RerankFact[];
+}
+
+/** Optional second pass. hybridRecall calls it only when llmRerank is set. */
+export interface Reranker {
+  rerank(input: RerankInput): Promise<readonly string[]> | readonly string[];
+}
+
 export interface OpenBankOptions {
   /** Rows are scoped to this id. Two ids in one file cannot see each other. */
   bankId?: string;
@@ -66,6 +81,8 @@ export interface OpenBankOptions {
   embedder?: Embedder | null;
   /** Defaults to brute-force cosine. Replace this to swap the ranking strategy. */
   vectorRanker?: VectorRanker;
+  /** Used by hybridRecall when llmRerank is true. Defaults to a local Ollama chat model. */
+  reranker?: Reranker | null;
 }
 
 export interface RetainInput {
@@ -125,4 +142,47 @@ export interface BackfillResult {
   embedded: number;
   /** Facts in this bank that still have no vector. */
   remaining: number;
+}
+
+export interface HybridWeights {
+  keyword?: number;
+  vector?: number;
+  graph?: number;
+}
+
+/** Reciprocal-rank contributions plus the recency multiplier. They explain `score`. */
+export interface ScoreBreakdown {
+  keyword: number;
+  vector: number;
+  graph: number;
+  recency: number;
+}
+
+export interface HybridFact extends FactRecord {
+  /** (keyword + vector + graph [+ a small in-window prior]) * recency. */
+  score: number;
+  breakdown: ScoreBreakdown;
+}
+
+export interface HybridRecallInput {
+  query: string;
+  tokenBudget: number;
+  /** Stop after this many facts that fit the budget. Omit to use the budget alone. */
+  limit?: number;
+  /** Reciprocal rank fusion weights. Each defaults to 1. */
+  weights?: HybridWeights;
+  /** RRF constant added to each rank. Defaults to 60. */
+  rrfK?: number;
+  /** Recency halves once per this many days. Defaults to 30. */
+  halfLifeDays?: number;
+  /** Clock for recency and time cues. Defaults to now. */
+  now?: string | Date;
+  /** Ask the reranker to reorder fused facts. Off by default. A failure keeps fusion order. */
+  llmRerank?: boolean;
+}
+
+export interface HybridRecallResult {
+  facts: HybridFact[];
+  /** Sum of estimateTokens(fact.text) for the facts returned. */
+  tokensUsed: number;
 }
