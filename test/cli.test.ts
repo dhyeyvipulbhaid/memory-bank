@@ -89,6 +89,53 @@ test("retain against a closed port fails and does not create facts", async () =>
   }
 });
 
+test("remembering the same text twice from the CLI stores one fact", async () => {
+  const db = join(tempDir(), "memory.sqlite");
+  const first = await run([
+    "remember",
+    "--db",
+    db,
+    "--text",
+    "Maya prefers morning meetings",
+    "--entities",
+    "Maya:person",
+    "--mentioned-at",
+    "2024-01-01T00:00:00.000Z",
+  ]);
+  const second = await run([
+    "remember",
+    "--db",
+    db,
+    "--text",
+    "  maya   prefers morning meetings ",
+    "--entities",
+    "Pepper:other",
+    "--mentioned-at",
+    "2024-06-02T00:00:00.000Z",
+  ]);
+
+  expect(first.code).toBe(0);
+  expect(second.code).toBe(0);
+  const saved = JSON.parse(first.stdout) as { id: string; text: string; mentionedAt: string };
+  const again = JSON.parse(second.stdout) as {
+    id: string;
+    text: string;
+    mentionedAt: string;
+    entities: Array<{ name: string }>;
+  };
+  expect(again.id).toBe(saved.id);
+  expect(again.text).toBe("Maya prefers morning meetings");
+  expect(again.mentionedAt).toBe(saved.mentionedAt);
+  expect(again.entities.map((entity) => entity.name).sort()).toEqual(["Maya", "Pepper"]);
+
+  const sqlite = new Database(db, { readonly: true });
+  try {
+    expect(sqlite.query("SELECT id FROM facts").all()).toHaveLength(1);
+  } finally {
+    sqlite.close();
+  }
+});
+
 test("missing command prints usage", async () => {
   const result = await run([]);
   expect(result.code).toBe(1);
