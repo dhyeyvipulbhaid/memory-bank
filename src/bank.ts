@@ -12,13 +12,20 @@ import {
   packHybridFacts,
   rankHybridFacts,
 } from "./hybrid.ts";
-import { isAssistantKnowledgeGap } from "./knowledge-gap.ts";
-import { acceptObservations, MAX_OBSERVATIONS, pruneOrphanObservations, saveObservations, scopeKey } from "./reflect.ts";
+import { isAssistantKnowledgeGap, junkReason } from "./knowledge-gap.ts";
+import {
+  acceptObservations,
+  MAX_OBSERVATIONS,
+  removeFacts,
+  saveObservations,
+  scopeKey,
+} from "./reflect.ts";
 import { createOllamaReflector } from "./reflector.ts";
 import { recallFacts } from "./recall.ts";
 import { createOllamaReranker, reorderByIds } from "./rerank.ts";
 import { assertEntityType, resolveMentions, type Mention } from "./resolve.ts";
 import { searchByVector } from "./semantic.ts";
+import { meaningfulTokens } from "./tokens.ts";
 import {
   FACT_KINDS,
   type BackfillResult,
@@ -27,6 +34,12 @@ import {
   type Extractor,
   type FactKind,
   type FactRecord,
+  type ListFactsInput,
+  type ListFactsResult,
+  type SweepJunkInput,
+  type SweepJunkResult,
+  type UpdateFactResult,
+  type ForgetManyResult,
   type OpenBankOptions,
   type RecallInput,
   type RecallResult,
@@ -293,22 +306,156 @@ export class MemoryBank {
   }
 
   /** Remove one fact. Observations that cited only that fact are removed too. */
-  forget(factId: string): { removedObservationIds: string[] } {
+  forget(factId: string): ForgetManyResult {
+    return this.forgetMany([factId]);
+  }
+
+  forgetMany(ids: readonly string[]): ForgetManyResult {
     this.assertOpen();
-    if (typeof factId !== "string" || factId.trim() === "") {
+    if (!Array.isArray(ids) || ids.length === 0) {
+      throw new MemoryBankError("forgetMany requires at least one fact id.");
+    }
+    if (ids.some((id) => typeof id !== "string" || id.trim() === "")) {
       throw new MemoryBankError("factId must be a non-empty string.");
     }
+    return removeFacts(this.db, this.bankId, ids);
+  }
+
+  /** Lists stored junk and, only when dryRun is false, deletes it. */
+  sweepJunk(input: SweepJunkInput = {}): SweepJunkResult {
+    this.assertOpen();
+    const dryRun = input.dryRun ?? true;
+    const rows = this.db
+      .query("SELECT id, text FROM facts WHERE bank_id = ? ORDER BY id")
+      .all(this.bankId) as Array<{ id: string; text: string }>;
+    const candidates = rows.flatMap((row) => {
+      const reason = junkReason(row.text);
+      return reason == null ? [] : [{ id: row.id, text: row.text, reason }];
+    });
+    if (dryRun || candidates.length === 0) {
+      return {
+        dryRun,
+        candidates,
+        deleted: 0,
+        removedObservationIds: [],
+        removedEntityIds: [],
+      };
+    }
+    const removed = removeFacts(
+      this.db,
+      this.bankId,
+      candidates.map((candidate) => candidate.id),
+    );
+    return {
+      dryRun: false,
+      candidates,
+      deleted: removed.removedFactIds.length,
+      removedObservationIds: removed.removedObservationIds,
+      removedEntityIds: removed.removedEntityIds,
+    };
+  }
+
+  listFacts(input: ListFactsInput): ListFactsResult {
+    this.assertOpen();
+    if (!Number.isInteger(input.limit) || input.limit < 1 || input.limit > 100) {
+      throw new MemoryBankError("limit must be an integer from 1 to 100.");
+    }
+    const offset = input.offset ?? 0;
+    if (!Number.isInteger(offset) || offset < 0) {
+      throw new MemoryBankError("offset must be an integer of zero or more.");
+    }
+    if (input.kind != null && !FACT_KINDS.includes(input.kind)) {
+      throw new MemoryBankError('kind must be "world" or "experience".');
+    }
+    const where = ["f.bank_id = ?"];
+    const params: Array<string | number> = [this.bankId];
+    if (input.kind) {
+      where.push("f.kind = ?");
+      params.push(input.kind);
+    }
+    const entity = input.entity?.trim();
+    if (entity) {
+      where.push(
+        `EXISTS (
+           SELECT 1 FROM edges g
+           JOIN entities e ON e.id = g.entity_id AND e.bank_id = g.bank_id
+           WHERE g.bank_id = f.bank_id AND g.fact_id = f.id AND g.edge_type = 'mentions'
+             AND (lower(e.canonical_name) = lower(?) OR lower(e.aliases_json) LIKE ?)
+         )`,
+      );
+      params.push(entity, `%${entity.toLowerCase()}%`);
+    }
+    for (const token of meaningfulTokens(input.query ?? "")) {
+      where.push("lower(f.text) LIKE ? ESCAPE '\\'");
+      params.push(`%${escapeLike(token)}%`);
+    }
+    const clause = where.join(" AND ");
+    const totalRow = this.db
+      .query(`SELECT COUNT(*) AS n FROM facts f WHERE ${clause}`)
+      .get(...params) as { n: number | bigint };
+    const rows = this.db
+      .query(
+        `SELECT f.id AS id, f.text AS text, f.kind AS kind, f.occurrence_time AS occurrence_time,
+                f.mentioned_at AS mentioned_at, f.source_id AS source_id
+         FROM facts f
+         WHERE ${clause}
+         ORDER BY f.mentioned_at DESC, f.id ASC
+         LIMIT ? OFFSET ?`,
+      )
+      .all(...params, input.limit, offset) as StoredFact[];
+    return {
+      facts: rows.map((row) => factRecord(this.db, this.bankId, row)),
+      total: Number(totalRow.n),
+    };
+  }
+
+  async updateFact(id: string, text: string): Promise<UpdateFactResult> {
+    this.assertOpen();
+    if (typeof id !== "string" || id.trim() === "") {
+      throw new MemoryBankError("factId must be a non-empty string.");
+    }
+    const next = requiredText(text, "text");
+    const vector = await this.vectorFor(next);
     const write = this.db.transaction(() => {
-      const existing = this.db
+      const current = this.db
         .query("SELECT id FROM facts WHERE id = ? AND bank_id = ?")
-        .get(factId, this.bankId) as { id: string } | null;
-      if (!existing) throw new MemoryBankError("No fact with that id is in this bank.");
-      this.db.query("DELETE FROM edges WHERE fact_id = ? AND bank_id = ?").run(factId, this.bankId);
+        .get(id, this.bankId) as { id: string } | null;
+      if (!current) throw new MemoryBankError("No fact with that id is in this bank.");
+      const duplicate = findIdenticalFact(this.db, this.bankId, next, id);
+      if (duplicate) {
+        moveFactMentions(this.db, this.bankId, duplicate.id, id);
+        if (vector) {
+          this.db
+            .query(
+              `UPDATE facts
+               SET embedding = ?, embedding_model = ?, embedding_dim = ?
+               WHERE id = ? AND bank_id = ? AND embedding IS NULL`,
+            )
+            .run(vector.bytes, vector.model, vector.dim, duplicate.id, this.bankId);
+        }
+        removeFacts(this.db, this.bankId, [id]);
+        const kept = this.db
+          .query(
+            `SELECT id, text, kind, occurrence_time, mentioned_at, source_id
+             FROM facts WHERE id = ? AND bank_id = ?`,
+          )
+          .get(duplicate.id, this.bankId) as StoredFact;
+        return { fact: factRecord(this.db, this.bankId, kept), mergedIntoExisting: true };
+      }
       this.db
-        .query("DELETE FROM observation_sources WHERE fact_id = ? AND bank_id = ?")
-        .run(factId, this.bankId);
-      this.db.query("DELETE FROM facts WHERE id = ? AND bank_id = ?").run(factId, this.bankId);
-      return { removedObservationIds: pruneOrphanObservations(this.db, this.bankId) };
+        .query(
+          `UPDATE facts
+           SET text = ?, embedding = ?, embedding_model = ?, embedding_dim = ?
+           WHERE id = ? AND bank_id = ?`,
+        )
+        .run(next.trim(), vector?.bytes ?? null, vector?.model ?? null, vector?.dim ?? null, id, this.bankId);
+      const updated = this.db
+        .query(
+          `SELECT id, text, kind, occurrence_time, mentioned_at, source_id
+           FROM facts WHERE id = ? AND bank_id = ?`,
+        )
+        .get(id, this.bankId) as StoredFact;
+      return { fact: factRecord(this.db, this.bankId, updated), mergedIntoExisting: false };
     });
     return write();
   }
@@ -705,7 +852,12 @@ interface StoredFact {
   source_id: string;
 }
 
-function findIdenticalFact(db: Database, bankId: string, text: string): StoredFact | null {
+function findIdenticalFact(
+  db: Database,
+  bankId: string,
+  text: string,
+  exceptId?: string,
+): StoredFact | null {
   const target = normalizeFactText(text);
   if (!target) return null;
   const rows = db
@@ -716,7 +868,39 @@ function findIdenticalFact(db: Database, bankId: string, text: string): StoredFa
        ORDER BY created_at ASC, mentioned_at ASC, id ASC`,
     )
     .all(bankId) as StoredFact[];
-  return rows.find((row) => normalizeFactText(row.text) === target) ?? null;
+  return rows.find((row) => row.id !== exceptId && normalizeFactText(row.text) === target) ?? null;
+}
+
+function factRecord(db: Database, bankId: string, row: StoredFact): FactRecord {
+  return {
+    id: row.id,
+    text: row.text,
+    kind: row.kind as FactKind,
+    occurrenceTime: row.occurrence_time,
+    mentionedAt: row.mentioned_at,
+    sourceId: row.source_id,
+    entities: entitiesForFact(db, bankId, row.id),
+  };
+}
+
+function moveFactMentions(db: Database, bankId: string, keeperId: string, extraId: string): void {
+  const edges = db
+    .query(
+      `SELECT entity_id FROM edges
+       WHERE bank_id = ? AND edge_type = 'mentions' AND fact_id = ?`,
+    )
+    .all(bankId, extraId) as Array<{ entity_id: string }>;
+  const insert = db.query(
+    `INSERT OR IGNORE INTO edges (id, bank_id, edge_type, fact_id, entity_id)
+     VALUES (?, ?, 'mentions', ?, ?)`,
+  );
+  for (const edge of edges) {
+    insert.run(crypto.randomUUID(), bankId, keeperId, edge.entity_id);
+  }
+}
+
+function escapeLike(token: string): string {
+  return token.replace(/[\\%_]/g, (character) => `\\${character}`);
 }
 
 function fillOccurrenceTime(
