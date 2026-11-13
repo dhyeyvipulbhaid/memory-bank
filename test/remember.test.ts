@@ -34,6 +34,31 @@ test("remember stores a knowledge disclaimer when the caller passes it", async (
   bank.close();
 });
 
+test("remember stores assistant inability and session narration when the caller passes them", async () => {
+  const path = dbPath();
+  const texts = [
+    "The assistant redirected the user to a search page for Pepper.",
+    "The assistant is unable to provide information about Pepper due to restrictions.",
+  ];
+  const bank = openBank(path, {
+    extractor: createFakeExtractor(() => {
+      throw new Error("extractor should not run for remember");
+    }),
+  });
+
+  for (const text of texts) {
+    const fact = await bank.remember({
+      text,
+      entities: [{ name: "Pepper", type: "person" }],
+    });
+    expect(fact.text).toBe(text);
+  }
+
+  const rows = readRows<{ text: string }>(path, "SELECT text FROM facts ORDER BY text");
+  expect(rows.map((row) => row.text)).toEqual([...texts].sort());
+  bank.close();
+});
+
 test("remember stores a manual fact without calling an extractor", async () => {
   const path = dbPath();
   const bank = openBank(path, {
