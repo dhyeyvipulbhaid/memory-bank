@@ -359,6 +359,12 @@ const keptBesideDisclaimers = [
   "I don't know who Pepper is. Maya prefers morning meetings.",
   "Maya has no information about the launch.",
   "I wrote down the decisions from the design review.",
+  "Maya visited Wikipedia yesterday.",
+  "I don't like morning meetings.",
+  "I visited Wikipedia yesterday.",
+  "I searched the warehouse yesterday.",
+  "The user denied the Wikipedia visit.",
+  "Alice searched the office for the launch notes.",
 ];
 
 test("retain keeps real facts, including genuine negatives, in the same exchange", async () => {
@@ -452,6 +458,151 @@ test("retain still stores real negatives and other near misses", async () => {
 
   const facts = readRows<{ text: string }>(path, "SELECT text FROM facts");
   expect(facts.map((row) => row.text).sort()).toEqual([...keptBesideDisclaimers].sort());
+  bank.close();
+});
+
+const assistantSessionNoise = [
+  "The assistant redirected the user to a search page for Pepper.",
+  "The assistant is unable to provide information about Pepper due to restrictions.",
+  "The assistant cannot provide information about Pepper.",
+  "I am unable to provide information about Pepper.",
+  "The assistant is not allowed to provide information about Pepper.",
+  "The model is not permitted to provide information about Pepper.",
+  "The assistant was denied access to information about Pepper.",
+  "I cannot provide that due to restrictions.",
+  "The assistant opened a search page for Pepper.",
+  "The assistant visited a Wikipedia page about Pepper.",
+  "I searched for Pepper.",
+  "I looked up Pepper.",
+  "The assistant clicked a search result for Pepper.",
+  "I typed a query for Pepper.",
+  "The assistant approved the visit.",
+  "The assistant denied the Wikipedia visit.",
+  "The assistant stopped the search.",
+];
+
+test("retain drops assistant inability claims and session narrations", async () => {
+  const path = dbPath();
+  const bank = openBank(path, {
+    extractor: createFakeExtractor((input) => [
+      {
+        text: input.content.trim(),
+        kind: "world" as const,
+        occurrenceTime: null,
+        entities: [{ name: "Pepper", type: "person" as const }],
+      },
+    ]),
+  });
+
+  for (const content of assistantSessionNoise) {
+    const result = await bank.retain({
+      content,
+      mentionedAt: "2026-11-12T22:15:00.000Z",
+    });
+    expect(result.facts).toEqual([]);
+  }
+
+  expect(readRows(path, "SELECT id FROM facts")).toHaveLength(0);
+  expect(readRows(path, "SELECT id FROM entities")).toHaveLength(0);
+  bank.close();
+});
+
+test("retain keeps Maya facts when the same extraction includes the Pepper session junk", async () => {
+  const path = dbPath();
+  const mentionedAt = "2026-11-12T22:15:00.000Z";
+  const extracted = [
+    {
+      text: "The assistant redirected the user to a search page for Pepper.",
+      entities: [{ name: "Pepper", type: "person" as const }],
+    },
+    {
+      text: "The assistant is unable to provide information about Pepper due to restrictions.",
+      entities: [{ name: "Pepper", type: "person" as const }],
+    },
+    {
+      text: "Maya prefers morning meetings.",
+      entities: [{ name: "Maya", type: "person" as const }],
+    },
+    {
+      text: "Maya does not have a preference for morning meetings.",
+      entities: [{ name: "Maya", type: "person" as const }],
+    },
+  ];
+  const bank = openBank(path, {
+    extractor: createFakeExtractor(() =>
+      extracted.map((fact) => ({
+        text: fact.text,
+        kind: "world" as const,
+        occurrenceTime: null,
+        entities: fact.entities,
+      })),
+    ),
+  });
+
+  const result = await bank.retain({
+    content:
+      "User: Who is Pepper? Assistant: I can't visit Wikipedia. Maya prefers morning meetings. Maya does not have a preference for morning meetings.",
+    mentionedAt,
+  });
+
+  expect(result.facts.map((fact) => fact.text)).toEqual([
+    "Maya prefers morning meetings.",
+    "Maya does not have a preference for morning meetings.",
+  ]);
+  expect(result.facts.every((fact) => fact.occurrenceTime === null)).toBe(true);
+  expect(result.facts.every((fact) => fact.mentionedAt === mentionedAt)).toBe(true);
+  const facts = readRows<{ text: string; occurrence_time: string | null }>(
+    path,
+    "SELECT text, occurrence_time FROM facts ORDER BY text",
+  );
+  expect(facts).toEqual([
+    {
+      text: "Maya does not have a preference for morning meetings.",
+      occurrence_time: null,
+    },
+    { text: "Maya prefers morning meetings.", occurrence_time: null },
+  ]);
+  const entities = readRows<{ canonical_name: string }>(
+    path,
+    "SELECT canonical_name FROM entities ORDER BY canonical_name",
+  );
+  expect(entities).toEqual([{ canonical_name: "Maya" }]);
+  bank.close();
+});
+
+test("assistant session noise does not take one of the five retain slots", async () => {
+  const path = dbPath();
+  const notes = Array.from({ length: 5 }, (_, index) => `Maya keeps harbor note ${index + 1}.`);
+  const bank = openBank(path, {
+    extractor: createFakeExtractor(() => [
+      {
+        text: "The assistant redirected the user to a search page for Pepper.",
+        kind: "world" as const,
+        occurrenceTime: null,
+        entities: [{ name: "Pepper", type: "person" as const }],
+      },
+      {
+        text: "The assistant is unable to provide information about Pepper due to restrictions.",
+        kind: "world" as const,
+        occurrenceTime: null,
+        entities: [{ name: "Pepper", type: "person" as const }],
+      },
+      ...notes.map((text) => ({
+        text,
+        kind: "world" as const,
+        occurrenceTime: null,
+        entities: [{ name: "Maya", type: "person" as const }],
+      })),
+    ]),
+  });
+
+  const result = await bank.retain({
+    content: "A chat that narrates a denied Wikipedia visit and five harbor notes.",
+    mentionedAt: "2026-11-12T22:15:00.000Z",
+  });
+
+  expect(result.facts.map((fact) => fact.text)).toEqual(notes);
+  expect(readRows<{ text: string }>(path, "SELECT text FROM facts")).toHaveLength(5);
   bank.close();
 });
 

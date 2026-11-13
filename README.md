@@ -83,7 +83,7 @@ Sends the text to the extractor, then stores the original text as a source docum
 
 Each fact is `world` (about other people or things) or `experience` (the agent's own action, written in first person by the extractor). `mentionedAt` is when the text was said. It defaults to now. `occurrenceTime` is when the event actually happened, and only when the source text names that occurrence. Preferences, standing facts, and undated statements leave it null. A missing occurrence is never filled with the current clock or with `mentionedAt`.
 
-A fact that only says the assistant, the model, or "I" lacks knowledge is dropped before it is saved. "The assistant does not have specific information about a person named Pepper" is not stored. A negative fact about someone else still is, including "Maya does not have a preference for morning meetings". Rows already in the file are left as they are. `remember` does not use this filter.
+A fact that only says the assistant, the model, or "I" lacks knowledge, cannot answer, or just did something in this chat or browser is dropped before it is saved. "The assistant does not have specific information about a person named Pepper" is not stored. Neither is "The assistant redirected the user to a search page for Pepper" or "The assistant is unable to provide information about Pepper due to restrictions." A negative fact about someone else still is, including "Maya does not have a preference for morning meetings" and "Maya visited Wikipedia yesterday." A first-person preference or dated experience, such as "I don't like morning meetings" or "I visited Wikipedia yesterday," is kept. Rows already in the file are left as they are. `remember` does not use this filter.
 
 Returns `{ sourceId, facts }`.
 
