@@ -164,6 +164,31 @@ The suite does not need Ollama. To check a real local server:
 MEMORY_BANK_OLLAMA_TEST=1 bun test test/ollama-embed.integration.test.ts
 ```
 
+### Hybrid recall
+
+Personal-Agents should call `hybridRecall` for the slice that goes into the next prompt. `recall` stays the keyword and entity lookup. It does not use vectors, neighbors, or time.
+
+`hybridRecall` builds three lists and fuses them with reciprocal rank fusion (`1 / (60 + rank)`, weights default to 1). The lists are keyword overlap, cosine similarity, and the entity graph. The graph list is a direct entity or alias match, plus facts that mention an entity one hop away (they share a fact with a matched entity). A missing embedder, or an embedder that throws, drops the vector list and the other two still run.
+
+Recency multiplies the fused score. It halves every `halfLifeDays` (default 30), using `occurrenceTime` when the fact has one and `mentionedAt` otherwise. Pass `now` in tests. A time cue in the query (`yesterday`, `last week`, `in March`, `2024-05-02`) keeps facts inside that UTC window and drops the rest. Weeks start on Monday. Facts inside the window with no other signal still surface, behind any real hit.
+
+Each fact includes `breakdown` with `keyword`, `vector`, `graph`, and `recency`. `score` is `(keyword + vector + graph) * recency`, plus a small prior when the fact sits in a parsed window. `llmRerank: true` asks Ollama to reorder that list. It is off by default. If the rerank call fails, fusion order is kept. `weights` changes the fusion.
+
+```ts
+const memory = await bank.hybridRecall({
+  query: "what did I do last week",
+  tokenBudget: 800,
+  halfLifeDays: 30,
+});
+// memory.facts[0].breakdown
+```
+
+```bash
+bun src/cli.ts hybrid --db ./memory.sqlite --query "what did I do last week" --token-budget 800
+bun test test/hybrid.test.ts test/time-window.test.ts
+MEMORY_BANK_OLLAMA_TEST=1 bun test test/ollama-embed.integration.test.ts
+```
+
 ### Extractors
 
 ```ts
@@ -206,6 +231,11 @@ bun src/cli.ts recall \
   --query "Maya meetings" \
   --token-budget 200
 
+bun src/cli.ts hybrid \
+  --db ./memory.sqlite \
+  --query "what did I do last week" \
+  --token-budget 800
+
 bun src/cli.ts retain \
   --db ./memory.sqlite \
   --content "Yesterday Maya said the launch moved to June." \
@@ -239,7 +269,7 @@ Opening a file from an older build adds the three embedding columns. Existing ro
 
 Extraction quality depends on the local model. The prompt asks for two to five coarse facts, and the bank keeps at most five. A small model may miss a fact, invent a detail, or choose a weak name. That is accepted for this version.
 
-Recall matches entity names and keywords. It will miss a paraphrase that shares neither. `semanticSearch` covers that case with brute-force cosine over stored vectors. There is no approximate nearest-neighbor index. Identical fact text is stored once per bank. Paraphrases stay separate.
+`recall` matches entity names and keywords. It will miss a paraphrase that shares neither. `hybridRecall` fuses that lookup with vectors, one-hop neighbors, and recency. `semanticSearch` is vectors alone. There is no approximate nearest-neighbor index. Identical fact text is stored once per bank. Paraphrases stay separate.
 
 Resolving a name loads that bank's entities. That is appropriate for a personal graph and will cost more if one bank grows very large.
 
