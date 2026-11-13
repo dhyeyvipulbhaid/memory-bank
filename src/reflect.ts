@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
 import { normalizeFactText } from "./dedupe.ts";
-import { ReflectFailedError } from "./errors.ts";
+import { MemoryBankError, ReflectFailedError } from "./errors.ts";
 import { isAssistantKnowledgeGap } from "./knowledge-gap.ts";
 import { meaningfulTokens } from "./tokens.ts";
 import type { ObservationDraft, ObservationRecord } from "./types.ts";
@@ -251,4 +251,81 @@ export function pruneOrphanObservations(db: Database, bankId?: string): string[]
     return doomed.map((row) => row.id);
   });
   return run();
+}
+
+export interface RemovedFacts {
+  removedFactIds: string[];
+  removedObservationIds: string[];
+  removedEntityIds: string[];
+}
+
+/** Delete facts, their mention links, observations that cited only them, and entities left with no links. */
+export function removeFacts(db: Database, bankId: string, ids: readonly string[]): RemovedFacts {
+  const unique = [...new Set(ids)];
+  const run = db.transaction(() => {
+    const existing = selectFactIds(db, bankId, unique);
+    if (existing.length !== unique.length) {
+      throw new MemoryBankError("No fact with that id is in this bank.");
+    }
+    const entityIds = linkedEntityIds(db, bankId, existing);
+    deleteByFactIds(db, "DELETE FROM edges WHERE bank_id = ? AND fact_id IN (", bankId, existing);
+    deleteByFactIds(
+      db,
+      "DELETE FROM observation_sources WHERE bank_id = ? AND fact_id IN (",
+      bankId,
+      existing,
+    );
+    deleteByFactIds(db, "DELETE FROM facts WHERE bank_id = ? AND id IN (", bankId, existing);
+    const removedObservationIds = pruneOrphanObservations(db, bankId);
+    const removedEntityIds = deleteOrphanEntities(db, bankId, entityIds);
+    return {
+      removedFactIds: existing,
+      removedObservationIds,
+      removedEntityIds,
+    };
+  });
+  return run();
+}
+
+function selectFactIds(db: Database, bankId: string, ids: readonly string[]): string[] {
+  if (ids.length === 0) return [];
+  const marks = ids.map(() => "?").join(", ");
+  const rows = db
+    .query(`SELECT id FROM facts WHERE bank_id = ? AND id IN (${marks})`)
+    .all(bankId, ...ids) as Array<{ id: string }>;
+  const found = new Set(rows.map((row) => row.id));
+  return ids.filter((id) => found.has(id));
+}
+
+function linkedEntityIds(db: Database, bankId: string, factIds: readonly string[]): string[] {
+  if (factIds.length === 0) return [];
+  const marks = factIds.map(() => "?").join(", ");
+  const rows = db
+    .query(
+      `SELECT DISTINCT entity_id AS id
+       FROM edges
+       WHERE bank_id = ? AND edge_type = 'mentions' AND fact_id IN (${marks})`,
+    )
+    .all(bankId, ...factIds) as Array<{ id: string }>;
+  return rows.map((row) => row.id);
+}
+
+function deleteByFactIds(db: Database, prefix: string, bankId: string, factIds: readonly string[]): void {
+  if (factIds.length === 0) return;
+  const marks = factIds.map(() => "?").join(", ");
+  db.query(`${prefix}${marks})`).run(bankId, ...factIds);
+}
+
+function deleteOrphanEntities(db: Database, bankId: string, entityIds: readonly string[]): string[] {
+  const removed: string[] = [];
+  const stillUsed = db.query(
+    `SELECT 1 AS ok FROM edges WHERE bank_id = ? AND entity_id = ? LIMIT 1`,
+  );
+  const remove = db.query("DELETE FROM entities WHERE id = ? AND bank_id = ?");
+  for (const id of entityIds) {
+    if (stillUsed.get(bankId, id)) continue;
+    remove.run(id, bankId);
+    removed.push(id);
+  }
+  return removed;
 }

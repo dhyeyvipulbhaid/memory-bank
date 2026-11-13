@@ -1,19 +1,73 @@
+export const JUNK_REASONS = [
+  "knowledge-gap",
+  "inability",
+  "session-narration",
+  "unknown",
+  "empty",
+] as const;
+export type JunkReason = (typeof JUNK_REASONS)[number];
+
+const PLACEHOLDERS = new Set([
+  "unknown",
+  "n/a",
+  "na",
+  "none",
+  "null",
+  "undefined",
+  "tbd",
+  "unk",
+]);
+
 /**
- * True when retain() should drop a fact. That is an assistant, model, or
- * first-person claim about lacking knowledge, being unable to answer, or a
- * just-now chat or browser action. remember() does not call this.
- *
+ * Why retain() would drop this text, or null when the text is a real fact.
+ * Every sentence must be assistant junk. A disclaimer mixed with any other
+ * sentence stays. Someone else's negative stays. A dated first-person
+ * experience stays. "unknown" and near-empty text are junk on their own.
+ */
+export function junkReason(text: string): JunkReason | null {
+  const placeholder = placeholderReason(text);
+  if (placeholder) return placeholder;
+  const sentences = sentencesOf(normalize(text));
+  if (sentences.length === 0) return "empty";
+  const reasons: JunkReason[] = [];
+  for (const sentence of sentences) {
+    const reason = sentenceReason(sentence);
+    if (reason == null) return null;
+    reasons.push(reason);
+  }
+  if (reasons.includes("inability")) return "inability";
+  if (reasons.includes("knowledge-gap")) return "knowledge-gap";
+  if (reasons.includes("session-narration")) return "session-narration";
+  return null;
+}
+
+/**
+ * True when retain() should drop a fact. remember() does not call this.
  * A sentence about someone else stays, including "Maya prefers morning
  * meetings" and "Maya visited Wikipedia yesterday". A first-person preference
- * or dated experience stays too. A fact that mixes a disclaimer with any
- * other sentence stays.
+ * or dated experience stays too.
  */
 export function isAssistantKnowledgeGap(text: string): boolean {
-  const sentences = sentencesOf(normalize(text));
-  if (sentences.length === 0) return false;
-  return sentences.every(
-    (sentence) => isGapSentence(sentence) || isJustNowSessionNarration(sentence),
-  );
+  return junkReason(text) != null;
+}
+
+function placeholderReason(text: string): JunkReason | null {
+  const trimmed = text.trim();
+  if (trimmed.length === 0) return "empty";
+  const letters = trimmed.replace(/[^a-z0-9]/gi, "");
+  if (letters.length < 2) return "empty";
+  const token = trimmed.toLowerCase().replace(/[.!?]+$/g, "").trim();
+  if (PLACEHOLDERS.has(token)) return "unknown";
+  return null;
+}
+
+function sentenceReason(sentence: string): JunkReason | null {
+  const predicate = assistantPredicate(sentence);
+  if (predicate == null) return null;
+  if (isInability(predicate)) return "inability";
+  if (isGapPredicate(predicate)) return "knowledge-gap";
+  if (!namesPastEvent(predicate) && isSessionPredicate(predicate)) return "session-narration";
+  return null;
 }
 
 function normalize(text: string): string {
@@ -69,12 +123,6 @@ function assistantPredicate(sentence: string): string | null {
   return predicate;
 }
 
-function isGapSentence(sentence: string): boolean {
-  const predicate = assistantPredicate(sentence);
-  if (predicate == null) return false;
-  return isGapPredicate(predicate);
-}
-
 /** A dated or relative occurrence is a world event, not this chat's tool use. */
 function namesPastEvent(predicate: string): boolean {
   const month =
@@ -92,13 +140,6 @@ function namesPastEvent(predicate: string): boolean {
     /\b(?:19|20)\d{2}\b/.test(predicate) ||
     /\b\d{1,2}\/\d{1,2}(?:\/\d{2,4})?\b/.test(predicate)
   );
-}
-
-function isJustNowSessionNarration(sentence: string): boolean {
-  const predicate = assistantPredicate(sentence);
-  if (predicate == null) return false;
-  if (namesPastEvent(predicate)) return false;
-  return isSessionPredicate(predicate);
 }
 
 const SESSION_PREFIX =
