@@ -1,16 +1,25 @@
 #!/usr/bin/env bun
-import { createOllamaExtractor, openBank, type EntityType, type MemoryBank } from "./index.ts";
+import {
+  createOllamaEmbedder,
+  createOllamaExtractor,
+  openBank,
+  type EntityType,
+  type MemoryBank,
+} from "./index.ts";
 import { ENTITY_TYPES } from "./types.ts";
 
 const USAGE = `memory-bank — local knowledge-graph memory
 
 Usage:
-  memory-bank retain --db <file> --content <text> [--context <text>] [--speaker <name>] [--mentioned-at <iso>] [--bank <id>] [--model <name>] [--host <url>] [--timeout-ms <n>]
-  memory-bank remember --db <file> --text <text> [--kind world|experience] [--entities Name:type,...] [--occurrence-time <iso>] [--mentioned-at <iso>] [--bank <id>]
+  memory-bank retain --db <file> --content <text> [--context <text>] [--speaker <name>] [--mentioned-at <iso>] [--bank <id>] [--model <name>] [--embed-model <name>] [--host <url>] [--timeout-ms <n>] [--no-embed]
+  memory-bank remember --db <file> --text <text> [--kind world|experience] [--entities Name:type,...] [--occurrence-time <iso>] [--mentioned-at <iso>] [--bank <id>] [--embed-model <name>] [--host <url>] [--timeout-ms <n>] [--no-embed]
   memory-bank recall --db <file> --query <text> --token-budget <n> [--bank <id>]
+  memory-bank backfill --db <file> [--bank <id>] [--embed-model <name>] [--host <url>] [--timeout-ms <n>]
 
-retain calls a local Ollama server (default model qwen3:8b at 127.0.0.1:11434).
-remember and recall do not use a model. The SQLite file is plain local data.
+retain calls a local Ollama server (default chat model qwen3:8b).
+remember and retain also embed with nomic-embed-text unless --no-embed is set.
+If embedding fails, the fact is still stored. recall does not use a model.
+backfill embeds facts that have no vector yet. The SQLite file is plain local data.
 `;
 
 export async function main(argv: string[]): Promise<number> {
@@ -21,12 +30,14 @@ export async function main(argv: string[]): Promise<number> {
       console.error(USAGE);
       return 1;
     }
-    if (command !== "retain" && command !== "remember" && command !== "recall") {
+    if (command !== "retain" && command !== "remember" && command !== "recall" && command !== "backfill") {
       console.error(`Unknown command: ${command}\n\n${USAGE}`);
       return 1;
     }
 
     const db = required(flags, "db");
+    const embed =
+      command === "backfill" || ((command === "retain" || command === "remember") && !flags.has("no-embed"));
     bank = openBank(db, {
       bankId: flags.get("bank"),
       extractor:
@@ -37,6 +48,13 @@ export async function main(argv: string[]): Promise<number> {
               timeoutMs: flags.has("timeout-ms") ? requireNumber(flags, "timeout-ms") : undefined,
             })
           : undefined,
+      embedder: embed
+        ? createOllamaEmbedder({
+            model: flags.get("embed-model"),
+            host: flags.get("host"),
+            timeoutMs: flags.has("timeout-ms") ? requireNumber(flags, "timeout-ms") : undefined,
+          })
+        : undefined,
     });
 
     if (command === "retain") {
@@ -56,11 +74,14 @@ export async function main(argv: string[]): Promise<number> {
         mentionedAt: flags.get("mentioned-at"),
       });
       console.log(JSON.stringify(result, null, 2));
-    } else {
+    } else if (command === "recall") {
       const result = await bank.recall({
         query: required(flags, "query"),
         tokenBudget: requireNumber(flags, "token-budget"),
       });
+      console.log(JSON.stringify(result, null, 2));
+    } else {
+      const result = await bank.backfillEmbeddings();
       console.log(JSON.stringify(result, null, 2));
     }
     return 0;
@@ -85,6 +106,10 @@ function parseArgs(argv: string[]): { command: string; flags: Map<string, string
       continue;
     }
     const key = token.slice(2);
+    if (key === "no-embed") {
+      flags.set(key, "true");
+      continue;
+    }
     const value = rest[index + 1];
     if (value == null || value.startsWith("--")) throw new Error(`Missing value for --${key}`);
     flags.set(key, value);
