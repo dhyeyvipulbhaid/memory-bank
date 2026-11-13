@@ -300,3 +300,187 @@ test("a missing occurrenceTime stays null instead of the current clock", async (
   expect(rows[0]?.mentioned_at).toBe(result.facts[0]?.mentionedAt);
   bank.close();
 });
+
+const knowledgeDisclaimers = [
+  "The assistant does not have specific information about a person named Pepper.",
+  "I don't know who Pepper is.",
+  "I do not have any information about Pepper.",
+  "I don't have information about that.",
+  "I'm not sure who that is.",
+  "The model does not have information about Pepper.",
+  "The assistant doesn't know who that is.",
+  "I have no information about a person named Pepper.",
+  "I am not sure who Pepper is.",
+  "I don\u2019t know who Pepper is.",
+  "I'm not familiar with Pepper.",
+  "The model has no knowledge of Pepper.",
+  "I do not know who that is.",
+  "  THE ASSISTANT DOES NOT HAVE SPECIFIC INFORMATION ABOUT A PERSON NAMED PEPPER.  ",
+];
+
+test("retain drops assistant knowledge disclaimers and does not create a fact row", async () => {
+  const path = dbPath();
+  const bank = openBank(path, {
+    extractor: createFakeExtractor((input) => [
+      {
+        text: input.content.trim(),
+        kind: "world" as const,
+        occurrenceTime: null,
+        entities: [{ name: "Pepper", type: "person" as const }],
+      },
+    ]),
+  });
+
+  for (const content of knowledgeDisclaimers) {
+    const result = await bank.retain({
+      content,
+      mentionedAt: "2026-11-12T22:15:00.000Z",
+    });
+    expect(result.facts).toEqual([]);
+  }
+
+  expect(readRows(path, "SELECT id FROM facts")).toHaveLength(0);
+  expect(readRows(path, "SELECT id FROM entities")).toHaveLength(0);
+  bank.close();
+});
+
+const keptBesideDisclaimers = [
+  "Maya prefers morning meetings.",
+  "Maya does not have a preference for morning meetings.",
+  "Alice does not know the launch date.",
+  "The user does not have information about Pepper.",
+  "I do not have a preference for morning meetings.",
+  "The assistant scheduled the Monday review.",
+  "The assistant does not have a preference for morning meetings.",
+  "I know who Pepper is.",
+  "I'm not sure Maya wants morning meetings.",
+  "Maya does not know who Pepper is.",
+  "I met Pepper on Tuesday.",
+  "I don't know who Pepper is. Maya prefers morning meetings.",
+  "Maya has no information about the launch.",
+  "I wrote down the decisions from the design review.",
+];
+
+test("retain keeps real facts, including genuine negatives, in the same exchange", async () => {
+  const path = dbPath();
+  const mentionedAt = "2026-11-12T22:15:00.000Z";
+  const extracted = [
+    {
+      text: "The assistant does not have specific information about a person named Pepper.",
+      entities: [{ name: "Pepper", type: "person" as const }],
+    },
+    {
+      text: "I don't know who Pepper is.",
+      entities: [{ name: "Pepper", type: "person" as const }],
+    },
+    {
+      text: "Maya prefers morning meetings.",
+      entities: [{ name: "Maya", type: "person" as const }],
+    },
+    {
+      text: "Maya does not have a preference for morning meetings.",
+      entities: [{ name: "Maya", type: "person" as const }],
+    },
+  ];
+  const bank = openBank(path, {
+    extractor: createFakeExtractor(() =>
+      extracted.map((fact) => ({
+        text: fact.text,
+        kind: "world" as const,
+        occurrenceTime: null,
+        entities: fact.entities,
+      })),
+    ),
+  });
+
+  const result = await bank.retain({
+    content:
+      "User: Who is Pepper? Assistant: I don't have information about Pepper. Maya prefers morning meetings. Maya does not have a preference for morning meetings.",
+    mentionedAt,
+  });
+
+  expect(result.facts.map((fact) => fact.text)).toEqual([
+    "Maya prefers morning meetings.",
+    "Maya does not have a preference for morning meetings.",
+  ]);
+  expect(result.facts.every((fact) => fact.occurrenceTime === null)).toBe(true);
+  expect(result.facts.every((fact) => fact.mentionedAt === mentionedAt)).toBe(true);
+  expect(result.facts.flatMap((fact) => fact.entities.map((entity) => entity.name))).toEqual([
+    "Maya",
+    "Maya",
+  ]);
+
+  const facts = readRows<{ text: string; occurrence_time: string | null }>(
+    path,
+    "SELECT text, occurrence_time FROM facts",
+  );
+  expect(facts).toHaveLength(2);
+  expect(facts.map((row) => row.text).sort()).toEqual([
+    "Maya does not have a preference for morning meetings.",
+    "Maya prefers morning meetings.",
+  ]);
+  expect(facts.every((row) => row.occurrence_time === null)).toBe(true);
+  const entities = readRows<{ canonical_name: string }>(
+    path,
+    "SELECT canonical_name FROM entities ORDER BY canonical_name",
+  );
+  expect(entities).toEqual([{ canonical_name: "Maya" }]);
+  bank.close();
+});
+
+test("retain still stores real negatives and other near misses", async () => {
+  const path = dbPath();
+  const bank = openBank(path, {
+    extractor: createFakeExtractor((input) => [
+      {
+        text: input.content,
+        kind: "world" as const,
+        occurrenceTime: null,
+        entities: [],
+      },
+    ]),
+  });
+
+  for (const content of keptBesideDisclaimers) {
+    const result = await bank.retain({
+      content,
+      mentionedAt: "2026-11-12T22:15:00.000Z",
+    });
+    expect(result.facts.map((fact) => fact.text)).toEqual([content]);
+    expect(result.facts[0]?.occurrenceTime).toBeNull();
+  }
+
+  const facts = readRows<{ text: string }>(path, "SELECT text FROM facts");
+  expect(facts.map((row) => row.text).sort()).toEqual([...keptBesideDisclaimers].sort());
+  bank.close();
+});
+
+test("a knowledge disclaimer does not take one of the five retain slots", async () => {
+  const path = dbPath();
+  const notes = Array.from({ length: 5 }, (_, index) => `Maya keeps harbor note ${index + 1}.`);
+  const bank = openBank(path, {
+    extractor: createFakeExtractor(() => [
+      {
+        text: "The assistant does not have specific information about a person named Pepper.",
+        kind: "world" as const,
+        occurrenceTime: null,
+        entities: [{ name: "Pepper", type: "person" as const }],
+      },
+      ...notes.map((text) => ({
+        text,
+        kind: "world" as const,
+        occurrenceTime: null,
+        entities: [{ name: "Maya", type: "person" as const }],
+      })),
+    ]),
+  });
+
+  const result = await bank.retain({
+    content: "A long note that includes a disclaimer and five harbor notes.",
+    mentionedAt: "2026-11-12T22:15:00.000Z",
+  });
+
+  expect(result.facts.map((fact) => fact.text)).toEqual(notes);
+  expect(readRows<{ text: string }>(path, "SELECT text FROM facts")).toHaveLength(5);
+  bank.close();
+});
