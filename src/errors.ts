@@ -21,6 +21,22 @@ export class EmbedderUnavailableError extends MemoryBankError {
   }
 }
 
+/** The reflect model could not be reached. Nothing was written. */
+export class ReflectorUnavailableError extends MemoryBankError {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "ReflectorUnavailableError";
+  }
+}
+
+/** The reflect model replied, but nothing valid could be stored. Nothing was written. */
+export class ReflectFailedError extends MemoryBankError {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "ReflectFailedError";
+  }
+}
+
 /** The extractor replied, but the payload was not usable. Nothing was written. */
 export class ExtractionFailedError extends MemoryBankError {
   constructor(message: string, options?: { cause?: unknown }) {

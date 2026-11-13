@@ -83,6 +83,8 @@ export interface OpenBankOptions {
   vectorRanker?: VectorRanker;
   /** Used by hybridRecall when llmRerank is true. Defaults to a local Ollama chat model. */
   reranker?: Reranker | null;
+  /** Used by reflect. Defaults to a local Ollama chat model. */
+  reflector?: Reflector | null;
 }
 
 export interface RetainInput {
@@ -158,7 +160,13 @@ export interface ScoreBreakdown {
   recency: number;
 }
 
-export interface HybridFact extends FactRecord {
+export interface HybridFact extends Omit<FactRecord, "kind"> {
+  kind: FactKind | "observation";
+  /** True when this row was synthesized by reflect rather than retained or remembered. */
+  derived: boolean;
+  /** Fact ids an observation was derived from. */
+  sourceFactIds?: string[];
+  confidence?: number;
   /** (keyword + vector + graph [+ a small in-window prior]) * recency. */
   score: number;
   breakdown: ScoreBreakdown;
@@ -179,6 +187,58 @@ export interface HybridRecallInput {
   now?: string | Date;
   /** Ask the reranker to reorder fused facts. Off by default. A failure keeps fusion order. */
   llmRerank?: boolean;
+  /** Include reflect observations. Defaults to true. */
+  includeObservations?: boolean;
+}
+
+export interface ObservationDraft {
+  text: string;
+  confidence: number;
+  sourceFactIds: string[];
+}
+
+export interface ReflectFact {
+  id: string;
+  text: string;
+  kind: string;
+  mentionedAt: string;
+}
+
+export interface ReflectRequest {
+  topic?: string;
+  facts: ReflectFact[];
+}
+
+export interface Reflector {
+  reflect(input: ReflectRequest): Promise<ObservationDraft[]> | ObservationDraft[];
+}
+
+export interface ReflectInput {
+  query?: string;
+  /** Entity name used to gather facts and to scope the run. */
+  entity?: string;
+  topic?: string;
+  since?: string | Date;
+  until?: string | Date;
+  /** Maximum observations stored from one run. Defaults to 5. */
+  maxObservations?: number;
+  now?: string | Date;
+}
+
+export interface ObservationRecord {
+  id: string;
+  text: string;
+  confidence: number;
+  derived: true;
+  sourceFactIds: string[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ReflectResult {
+  observations: ObservationRecord[];
+  /** Previous observations in this scope that were replaced. */
+  removedIds: string[];
 }
 
 export interface HybridRecallResult {

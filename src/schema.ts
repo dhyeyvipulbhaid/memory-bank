@@ -11,7 +11,11 @@ const EMBEDDING_COLUMNS: Array<{ name: string; ddl: string }> = [
  * existing fact and leaves the vector null for a later backfill.
  */
 export function migrateSchema(db: Database): void {
-  if (schemaVersion(db) >= 2) return;
+  if (schemaVersion(db) < 2) migrateEmbeddings(db);
+  if (schemaVersion(db) < 3) migrateObservations(db);
+}
+
+function migrateEmbeddings(db: Database): void {
   const names = new Set(
     (db.query("PRAGMA table_info(facts)").all() as Array<{ name: string }>).map((row) => row.name),
   );
@@ -23,6 +27,40 @@ export function migrateSchema(db: Database): void {
   });
   apply();
 }
+
+function migrateObservations(db: Database): void {
+  const apply = db.transaction(() => {
+    db.exec(OBSERVATIONS_SQL);
+    db.query("UPDATE schema_meta SET value = '3' WHERE key = 'version'").run();
+  });
+  apply();
+}
+
+const OBSERVATIONS_SQL = `
+CREATE TABLE IF NOT EXISTS observations (
+  id TEXT PRIMARY KEY,
+  bank_id TEXT NOT NULL,
+  scope_key TEXT NOT NULL,
+  text TEXT NOT NULL,
+  confidence REAL NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  embedding BLOB,
+  embedding_model TEXT,
+  embedding_dim INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_observations_scope ON observations(bank_id, scope_key);
+
+CREATE TABLE IF NOT EXISTS observation_sources (
+  observation_id TEXT NOT NULL REFERENCES observations(id) ON DELETE CASCADE,
+  fact_id TEXT NOT NULL REFERENCES facts(id) ON DELETE CASCADE,
+  bank_id TEXT NOT NULL,
+  PRIMARY KEY (observation_id, fact_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_observation_sources_fact ON observation_sources(bank_id, fact_id);
+`;
 
 function schemaVersion(db: Database): number {
   const row = db.query("SELECT value FROM schema_meta WHERE key = 'version'").get() as
@@ -100,4 +138,28 @@ CREATE TABLE IF NOT EXISTS edges (
 
 CREATE INDEX IF NOT EXISTS idx_edges_entity ON edges(bank_id, entity_id);
 CREATE INDEX IF NOT EXISTS idx_edges_fact ON edges(bank_id, fact_id);
+
+CREATE TABLE IF NOT EXISTS observations (
+  id TEXT PRIMARY KEY,
+  bank_id TEXT NOT NULL,
+  scope_key TEXT NOT NULL,
+  text TEXT NOT NULL,
+  confidence REAL NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  embedding BLOB,
+  embedding_model TEXT,
+  embedding_dim INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_observations_scope ON observations(bank_id, scope_key);
+
+CREATE TABLE IF NOT EXISTS observation_sources (
+  observation_id TEXT NOT NULL REFERENCES observations(id) ON DELETE CASCADE,
+  fact_id TEXT NOT NULL REFERENCES facts(id) ON DELETE CASCADE,
+  bank_id TEXT NOT NULL,
+  PRIMARY KEY (observation_id, fact_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_observation_sources_fact ON observation_sources(bank_id, fact_id);
 `;

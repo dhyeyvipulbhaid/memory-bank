@@ -189,6 +189,31 @@ bun test test/hybrid.test.ts test/time-window.test.ts
 MEMORY_BANK_OLLAMA_TEST=1 bun test test/ollama-embed.integration.test.ts
 ```
 
+### Reflect
+
+`reflect` reads facts in a scope and asks Ollama for a few observations. Each one cites the fact ids it came from. They are stored apart from world and experience facts, with a confidence and an embedding when the embedder is up. `hybridRecall` returns them with `derived: true` unless you pass `includeObservations: false`. `recall` does not return them.
+
+The scope is the query, entity, topic, and time bounds. Running `reflect` again on that same scope updates an observation whose text is unchanged and deletes observations the model no longer returns. `forget(factId)` removes that fact. An observation that cited only the forgotten fact is removed. One that still cites another fact stays.
+
+A draft that cites nothing, cites an id that was not gathered, or fails the same junk filter as `retain` is dropped. If none remain, nothing is written. The default cap is 5. If Ollama is down, `reflect` throws and writes nothing.
+
+The default chat model is `qwen3:8b`. `host` is the Ollama base URL.
+
+```ts
+const reflected = await bank.reflect({
+  query: "Maya meetings",
+  maxObservations: 5,
+});
+// reflected.observations[0].sourceFactIds
+```
+
+```bash
+ollama pull qwen3:8b
+bun src/cli.ts reflect --db ./memory.sqlite --query "Maya meetings" --model qwen3:8b
+bun test test/reflect.test.ts
+MEMORY_BANK_OLLAMA_TEST=1 bun test test/ollama-reflect.integration.test.ts
+```
+
 ### Extractors
 
 ```ts
@@ -235,6 +260,11 @@ bun src/cli.ts hybrid \
   --db ./memory.sqlite \
   --query "what did I do last week" \
   --token-budget 800
+
+bun src/cli.ts reflect \
+  --db ./memory.sqlite \
+  --query "Maya meetings" \
+  --model qwen3:8b
 
 bun src/cli.ts retain \
   --db ./memory.sqlite \
