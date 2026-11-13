@@ -1,3 +1,37 @@
+import type { Database } from "bun:sqlite";
+
+const EMBEDDING_COLUMNS: Array<{ name: string; ddl: string }> = [
+  { name: "embedding", ddl: "ALTER TABLE facts ADD COLUMN embedding BLOB" },
+  { name: "embedding_model", ddl: "ALTER TABLE facts ADD COLUMN embedding_model TEXT" },
+  { name: "embedding_dim", ddl: "ALTER TABLE facts ADD COLUMN embedding_dim INTEGER" },
+];
+
+/**
+ * Version 1 files have no vector columns. Adding nullable columns keeps every
+ * existing fact and leaves the vector null for a later backfill.
+ */
+export function migrateSchema(db: Database): void {
+  if (schemaVersion(db) >= 2) return;
+  const names = new Set(
+    (db.query("PRAGMA table_info(facts)").all() as Array<{ name: string }>).map((row) => row.name),
+  );
+  const apply = db.transaction(() => {
+    for (const column of EMBEDDING_COLUMNS) {
+      if (!names.has(column.name)) db.exec(column.ddl);
+    }
+    db.query("UPDATE schema_meta SET value = '2' WHERE key = 'version'").run();
+  });
+  apply();
+}
+
+function schemaVersion(db: Database): number {
+  const row = db.query("SELECT value FROM schema_meta WHERE key = 'version'").get() as
+    | { value: string }
+    | null;
+  const version = Number(row?.value ?? 0);
+  return Number.isFinite(version) ? version : 0;
+}
+
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS schema_meta (
   key TEXT PRIMARY KEY,
@@ -47,7 +81,10 @@ CREATE TABLE IF NOT EXISTS facts (
   occurrence_time TEXT,
   mentioned_at TEXT NOT NULL,
   source_id TEXT NOT NULL REFERENCES sources(id),
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  embedding BLOB,
+  embedding_model TEXT,
+  embedding_dim INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_facts_bank ON facts(bank_id, mentioned_at);

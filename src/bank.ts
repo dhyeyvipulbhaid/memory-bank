@@ -2,13 +2,17 @@ import type { Database } from "bun:sqlite";
 import { chunkText } from "./chunk.ts";
 import { openDatabase } from "./db.ts";
 import { normalizeFactText } from "./dedupe.ts";
-import { MemoryBankError } from "./errors.ts";
+import { createBruteForceCosineRanker, prepareEmbedding } from "./embed.ts";
+import { EmbedderUnavailableError, MemoryBankError } from "./errors.ts";
 import { normalizeExtractedFacts } from "./extract/validate.ts";
 import { isAssistantKnowledgeGap } from "./knowledge-gap.ts";
 import { recallFacts } from "./recall.ts";
 import { assertEntityType, resolveMentions, type Mention } from "./resolve.ts";
+import { searchByVector } from "./semantic.ts";
 import {
   FACT_KINDS,
+  type BackfillResult,
+  type Embedder,
   type ExtractedFact,
   type Extractor,
   type FactKind,
@@ -19,6 +23,8 @@ import {
   type RememberInput,
   type RetainInput,
   type RetainResult,
+  type SemanticSearchInput,
+  type VectorRanker,
 } from "./types.ts";
 
 export class MemoryBank {
@@ -29,6 +35,8 @@ export class MemoryBank {
     readonly path: string,
     readonly bankId: string,
     private readonly extractor: Extractor | undefined,
+    private readonly embedder: Embedder | undefined,
+    private readonly ranker: VectorRanker,
   ) {}
 
   async retain(input: RetainInput): Promise<RetainResult> {
@@ -53,6 +61,7 @@ export class MemoryBank {
       throw new MemoryBankError("Extraction failed; nothing was written.", { cause: error });
     }
     const facts = factsToRetain(normalizeExtractedFacts(extracted));
+    const vectors = await Promise.all(facts.map((fact) => this.vectorFor(fact.text)));
     const write = this.db.transaction((): RetainResult => {
       const sourceId = insertSource(this.db, this.bankId, {
         text: content,
@@ -61,7 +70,7 @@ export class MemoryBank {
         mentionedAt,
       });
       insertChunks(this.db, this.bankId, sourceId, chunkText(content));
-      const saved = facts.map((fact) =>
+      const saved = facts.map((fact, index) =>
         saveFact(this.db, this.bankId, {
           text: fact.text,
           kind: fact.kind,
@@ -69,6 +78,7 @@ export class MemoryBank {
           mentionedAt,
           sourceId,
           mentions: fact.entities,
+          vector: vectors[index] ?? null,
         }),
       );
       return { sourceId, facts: saved };
@@ -90,6 +100,7 @@ export class MemoryBank {
       name: entity.name,
       type: entity.type ? assertEntityType(entity.type) : "other",
     }));
+    const vector = await this.vectorFor(text);
 
     const write = this.db.transaction(() => {
       const sourceId = insertSource(this.db, this.bankId, {
@@ -106,6 +117,7 @@ export class MemoryBank {
         mentionedAt,
         sourceId,
         mentions,
+        vector,
       });
     });
     return write();
@@ -119,6 +131,77 @@ export class MemoryBank {
     return recallFacts(this.db, this.bankId, input.query, input.tokenBudget);
   }
 
+  async semanticSearch(input: SemanticSearchInput): Promise<RecallResult> {
+    this.assertOpen();
+    if (typeof input.query !== "string") {
+      throw new MemoryBankError("query must be a string.");
+    }
+    const limit = input.limit ?? 10;
+    if (!Number.isInteger(limit) || limit < 0) {
+      throw new MemoryBankError("limit must be an integer of zero or more.");
+    }
+    if (!Number.isFinite(input.tokenBudget) || input.tokenBudget < 0) {
+      throw new MemoryBankError("tokenBudget must be a finite number of zero or more.");
+    }
+    if (input.query.trim() === "" || input.tokenBudget === 0 || limit === 0) {
+      return { facts: [], tokensUsed: 0 };
+    }
+    if (!this.embedder) {
+      throw new MemoryBankError(
+        "semanticSearch needs an embedder. Pass createOllamaEmbedder() to openBank().",
+      );
+    }
+    if (this.countEmbedded(this.embedder.model) === 0) {
+      return { facts: [], tokensUsed: 0 };
+    }
+    const prepared = await this.prepareText(input.query);
+    return searchByVector(
+      this.db,
+      this.bankId,
+      prepared.vector,
+      this.embedder.model,
+      input.tokenBudget,
+      limit,
+      this.ranker,
+    );
+  }
+
+  /**
+   * Embeds facts in this bank that have no vector. Rows already written are
+   * committed before the next fact, so a failure can be retried.
+   */
+  async backfillEmbeddings(): Promise<BackfillResult> {
+    this.assertOpen();
+    const embedder = this.embedder;
+    if (!embedder) {
+      throw new MemoryBankError(
+        "backfillEmbeddings needs an embedder. Pass createOllamaEmbedder() to openBank().",
+      );
+    }
+    const rows = this.db
+      .query(
+        `SELECT id, text
+         FROM facts
+         WHERE bank_id = ? AND embedding IS NULL
+         ORDER BY created_at ASC, id ASC`,
+      )
+      .all(this.bankId) as Array<{ id: string; text: string }>;
+
+    let embedded = 0;
+    for (const row of rows) {
+      const prepared = await this.prepareText(row.text);
+      const result = this.db
+        .query(
+          `UPDATE facts
+           SET embedding = ?, embedding_model = ?, embedding_dim = ?
+           WHERE id = ? AND bank_id = ? AND embedding IS NULL`,
+        )
+        .run(prepared.bytes, embedder.model, prepared.dim, row.id, this.bankId);
+      embedded += Number(result.changes);
+    }
+    return { embedded, remaining: this.countMissing() };
+  }
+
   close(): void {
     if (this.closed) return;
     this.closed = true;
@@ -128,6 +211,54 @@ export class MemoryBank {
   private assertOpen(): void {
     if (this.closed) throw new MemoryBankError("This memory bank is closed.");
   }
+
+  /** Null when no embedder is configured or the embedder cannot answer. The fact is still stored. */
+  private async vectorFor(text: string): Promise<StoredVector | null> {
+    if (!this.embedder) return null;
+    const model = this.embedder.model;
+    try {
+      const prepared = await this.prepareText(text);
+      return { model, dim: prepared.dim, bytes: prepared.bytes };
+    } catch {
+      return null;
+    }
+  }
+
+  private async prepareText(text: string): Promise<{ dim: number; bytes: Uint8Array; vector: Float32Array }> {
+    if (!this.embedder) {
+      throw new MemoryBankError(
+        "An embedder is required. Pass createOllamaEmbedder() to openBank().",
+      );
+    }
+    let raw: readonly number[];
+    try {
+      raw = await this.embedder.embed(text);
+    } catch (error) {
+      if (error instanceof EmbedderUnavailableError) throw error;
+      throw new EmbedderUnavailableError("Embedding failed.", { cause: error });
+    }
+    const prepared = prepareEmbedding(raw);
+    if (!prepared) throw new EmbedderUnavailableError("Embedder returned an empty vector.");
+    return prepared;
+  }
+
+  private countEmbedded(model: string): number {
+    const row = this.db
+      .query(
+        `SELECT COUNT(*) AS n
+         FROM facts
+         WHERE bank_id = ? AND embedding IS NOT NULL AND embedding_model = ?`,
+      )
+      .get(this.bankId, model) as { n: number | bigint };
+    return Number(row.n);
+  }
+
+  private countMissing(): number {
+    const row = this.db
+      .query("SELECT COUNT(*) AS n FROM facts WHERE bank_id = ? AND embedding IS NULL")
+      .get(this.bankId) as { n: number | bigint };
+    return Number(row.n);
+  }
 }
 
 export function openBank(path: string, options: OpenBankOptions = {}): MemoryBank {
@@ -136,7 +267,14 @@ export function openBank(path: string, options: OpenBankOptions = {}): MemoryBan
   }
   const bankId = (options.bankId ?? "default").trim();
   if (!bankId) throw new MemoryBankError("bankId cannot be empty.");
-  return new MemoryBank(openDatabase(path), path, bankId, options.extractor);
+  return new MemoryBank(
+    openDatabase(path),
+    path,
+    bankId,
+    options.extractor,
+    options.embedder ?? undefined,
+    options.vectorRanker ?? createBruteForceCosineRanker(),
+  );
 }
 
 const MAX_RETAINED_FACTS = 5;
@@ -227,6 +365,12 @@ function insertChunks(db: Database, bankId: string, sourceId: string, chunks: st
   });
 }
 
+interface StoredVector {
+  model: string;
+  dim: number;
+  bytes: Uint8Array;
+}
+
 function saveFact(
   db: Database,
   bankId: string,
@@ -237,12 +381,20 @@ function saveFact(
     mentionedAt: string;
     sourceId: string;
     mentions: Mention[];
+    vector: StoredVector | null;
   },
 ): FactRecord {
   const entities = resolveMentions(db, bankId, fact.mentions);
   const existing = findIdenticalFact(db, bankId, fact.text);
   if (existing) {
     linkMentions(db, bankId, existing.id, entities);
+    if (fact.vector) {
+      db.query(
+        `UPDATE facts
+         SET embedding = ?, embedding_model = ?, embedding_dim = ?
+         WHERE id = ? AND bank_id = ? AND embedding IS NULL`,
+      ).run(fact.vector.bytes, fact.vector.model, fact.vector.dim, existing.id, bankId);
+    }
     return {
       id: existing.id,
       text: existing.text,
@@ -257,8 +409,10 @@ function saveFact(
   const id = crypto.randomUUID();
   const text = fact.text.trim();
   db.query(
-    `INSERT INTO facts (id, bank_id, text, kind, occurrence_time, mentioned_at, source_id, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO facts (
+       id, bank_id, text, kind, occurrence_time, mentioned_at, source_id, created_at,
+       embedding, embedding_model, embedding_dim
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     id,
     bankId,
@@ -268,6 +422,9 @@ function saveFact(
     fact.mentionedAt,
     fact.sourceId,
     new Date().toISOString(),
+    fact.vector?.bytes ?? null,
+    fact.vector?.model ?? null,
+    fact.vector?.dim ?? null,
   );
   linkMentions(db, bankId, id, entities);
   return {
