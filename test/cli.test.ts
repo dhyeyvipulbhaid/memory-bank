@@ -35,6 +35,7 @@ test("remember and recall work from the CLI without a model", async () => {
   const db = join(tempDir(), "memory.sqlite");
   const saved = await run([
     "remember",
+    "--no-embed",
     "--db",
     db,
     "--text",
@@ -93,6 +94,7 @@ test("remembering the same text twice from the CLI stores one fact", async () =>
   const db = join(tempDir(), "memory.sqlite");
   const first = await run([
     "remember",
+    "--no-embed",
     "--db",
     db,
     "--text",
@@ -104,6 +106,7 @@ test("remembering the same text twice from the CLI stores one fact", async () =>
   ]);
   const second = await run([
     "remember",
+    "--no-embed",
     "--db",
     db,
     "--text",
@@ -134,6 +137,76 @@ test("remembering the same text twice from the CLI stores one fact", async () =>
   } finally {
     sqlite.close();
   }
+});
+
+test("backfill against a closed port fails and leaves the stored fact", async () => {
+  const db = join(tempDir(), "memory.sqlite");
+  const saved = await run([
+    "remember",
+    "--no-embed",
+    "--db",
+    db,
+    "--text",
+    "Nia keeps a red notebook.",
+    "--mentioned-at",
+    "2024-08-01T00:00:00.000Z",
+  ]);
+  expect(saved.code).toBe(0);
+
+  const backfill = await run([
+    "backfill",
+    "--db",
+    db,
+    "--host",
+    "http://127.0.0.1:9",
+    "--timeout-ms",
+    "500",
+  ]);
+  expect(backfill.code).toBe(1);
+  expect(backfill.stderr.toLowerCase()).toContain("ollama");
+
+  const sqlite = new Database(db, { readonly: true });
+  try {
+    const rows = sqlite.query("SELECT text, embedding FROM facts").all() as Array<{
+      text: string;
+      embedding: Uint8Array | null;
+    }>;
+    expect(rows).toEqual([{ text: "Nia keeps a red notebook.", embedding: null }]);
+  } finally {
+    sqlite.close();
+  }
+});
+
+test("remember stores the fact when the embed server is down", async () => {
+  const db = join(tempDir(), "memory.sqlite");
+  const saved = await run([
+    "remember",
+    "--db",
+    db,
+    "--text",
+    "Nia keeps a red notebook.",
+    "--host",
+    "http://127.0.0.1:9",
+    "--timeout-ms",
+    "500",
+    "--mentioned-at",
+    "2024-08-01T00:00:00.000Z",
+  ]);
+  expect(saved.code).toBe(0);
+  expect(JSON.parse(saved.stdout).text).toBe("Nia keeps a red notebook.");
+
+  const sqlite = new Database(db, { readonly: true });
+  try {
+    const rows = sqlite.query("SELECT embedding FROM facts").all() as Array<{ embedding: Uint8Array | null }>;
+    expect(rows).toEqual([{ embedding: null }]);
+  } finally {
+    sqlite.close();
+  }
+
+  const recalled = await run(["recall", "--db", db, "--query", "Nia notebook", "--token-budget", "40"]);
+  expect(recalled.code).toBe(0);
+  const body = JSON.parse(recalled.stdout) as { facts: Array<{ text: string }> };
+  expect(body.facts.map((fact) => fact.text)).toEqual(["Nia keeps a red notebook."]);
 });
 
 test("missing command prints usage", async () => {
