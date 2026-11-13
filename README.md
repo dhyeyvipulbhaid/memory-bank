@@ -10,7 +10,7 @@ This is a library and a small command-line tool. A host app can import it later.
 
 Memory stays on the machine. In v1 the SQLite file is **not encrypted**. Anyone who can read the file can read the memory.
 
-`retain` is the only call that uses the network, and only to Ollama at `127.0.0.1:11434` unless you point it somewhere else. `remember` and `recall` work with Ollama stopped. If Ollama is down, or the model reply is not usable JSON, `retain` throws and does not write a partial result.
+`retain` calls Ollama to extract facts. If that call fails, or the reply is not usable JSON, `retain` throws and does not write a partial result. `remember` and `recall` do not extract, and they work with Ollama stopped. When you pass an embedder, `retain` and `remember` also ask Ollama for a vector. If that call fails, the fact is still saved and the vector stays null. `recall` never calls the network.
 
 ## Requirements
 
@@ -110,6 +110,60 @@ Finds facts by entity name and by keyword overlap, ranks them, and returns the o
 
 `tokenBudget` is measured with `estimateTokens`, which is `ceil(characters / 4)` of the fact text. `tokensUsed` is the sum of that cost for the facts returned. A fact that does not fit in the remaining budget is skipped.
 
+### Semantic search
+
+`recall` matches names and keywords. A paraphrase that shares no words with the fact is invisible to it. `semanticSearch` embeds the query and ranks facts by cosine similarity, then keeps the top results that fit `tokenBudget`.
+
+Pull the embed model once:
+
+```bash
+ollama pull nomic-embed-text
+```
+
+Pass an embedder when you open the bank. `model` defaults to `nomic-embed-text`. `host` is the Ollama base URL and defaults to `http://127.0.0.1:11434`.
+
+```ts
+import { createOllamaEmbedder, createOllamaExtractor, openBank } from "memory-bank";
+
+const bank = openBank("./memory.sqlite", {
+  extractor: createOllamaExtractor({ model: "qwen3:8b" }),
+  embedder: createOllamaEmbedder({
+    model: "nomic-embed-text",
+    host: "http://127.0.0.1:11434",
+  }),
+});
+```
+
+Each new fact stores a little-endian float32 blob, the model name, and the dimension. Facts written with no embedder, or while Ollama was down, have a null vector. Keyword `recall` still finds them.
+
+`backfillEmbeddings` fills those nulls and skips rows that already have a vector. It commits each fact before the next one. If it stops, run it again and it continues. It does not replace a vector that is already stored, including one from a different model. Search only compares vectors saved for the embedder's model and dimension.
+
+```ts
+const filled = await bank.backfillEmbeddings();
+// filled.embedded, filled.remaining
+
+const memory = await bank.semanticSearch({
+  query: "where does the dog play",
+  tokenBudget: 800,
+  limit: 10,
+});
+```
+
+`limit` defaults to 10. Ranking is brute-force cosine behind a `VectorRanker`. Pass `vectorRanker` to `openBank` to swap that later.
+
+From the command line, `remember` and `retain` embed unless you pass `--no-embed`. `--embed-model` and `--host` override the defaults. Backfill:
+
+```bash
+bun src/cli.ts backfill --db ./memory.sqlite
+bun src/cli.ts backfill --db ./memory.sqlite --embed-model nomic-embed-text --host http://127.0.0.1:11434
+```
+
+The suite does not need Ollama. To check a real local server:
+
+```bash
+MEMORY_BANK_OLLAMA_TEST=1 bun test test/ollama-embed.integration.test.ts
+```
+
 ### Extractors
 
 ```ts
@@ -156,9 +210,14 @@ bun src/cli.ts retain \
   --db ./memory.sqlite \
   --content "Yesterday Maya said the launch moved to June." \
   --speaker user
+
+bun src/cli.ts backfill \
+  --db ./memory.sqlite \
+  --embed-model nomic-embed-text \
+  --host http://127.0.0.1:11434
 ```
 
-`retain` needs Ollama. `--model`, `--host`, and `--timeout-ms` override the defaults. `--bank` selects a bank id inside the file. Results are JSON on stdout. Errors go to stderr and the process exits 1.
+`retain` needs Ollama for extraction. `--model`, `--host`, and `--timeout-ms` override the defaults. `--embed-model` chooses the embedding model (default `nomic-embed-text`). `--no-embed` skips that call. `--bank` selects a bank id inside the file. Results are JSON on stdout. Errors go to stderr and the process exits 1.
 
 Entity flags look like `Alice Chen:person,Orbit:product`.
 
@@ -171,14 +230,16 @@ One SQLite file. Isolation column on every table: `bank_id`.
 | `sources` | Original text, optional context and speaker, `mentioned_at` |
 | `source_chunks` | The same text split up when it is long. The full text stays on `sources`. |
 | `entities` | `canonical_name`, `aliases_json`, `type` (`person`, `org`, `place`, `product`, `concept`, `other`) |
-| `facts` | `text`, `kind` (`world` or `experience`), `occurrence_time` (nullable), `mentioned_at`, `source_id` |
+| `facts` | `text`, `kind` (`world` or `experience`), `occurrence_time` (nullable), `mentioned_at`, `source_id`, `embedding` (float32 blob, nullable), `embedding_model`, `embedding_dim` |
 | `edges` | `edge_type` is `mentions`. A fact mentions an entity. |
+
+Opening a file from an older build adds the three embedding columns. Existing rows keep a null vector.
 
 ## Limits in v1
 
 Extraction quality depends on the local model. The prompt asks for two to five coarse facts, and the bank keeps at most five. A small model may miss a fact, invent a detail, or choose a weak name. That is accepted for this version.
 
-Recall matches entity names and keywords. It will miss a paraphrase that shares neither. Identical fact text is stored once per bank. Paraphrases stay separate. There is no vector index.
+Recall matches entity names and keywords. It will miss a paraphrase that shares neither. `semanticSearch` covers that case with brute-force cosine over stored vectors. There is no approximate nearest-neighbor index. Identical fact text is stored once per bank. Paraphrases stay separate.
 
 Resolving a name loads that bank's entities. That is appropriate for a personal graph and will cost more if one bank grows very large.
 
