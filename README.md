@@ -234,6 +234,21 @@ bun src/cli.ts forget --db ./memory.sqlite --id <fact-id>
 bun test test/sweep.test.ts
 ```
 
+### Memory graph
+
+`graphSnapshot` returns `{ nodes, edges }` for a force-directed view. Nodes are the most recent facts and observations in the window. `recency` runs from 0 to 1 for color. `sourceFactCount` is the node size. Edges are `semantic` (cosine neighbors above `minSimilarity`, default 0.72), `temporal` (the next fact within a week), `entity` (a shared mention, a few per fact), and `derived` (an observation pointing at the facts it cites). The slice is capped at 200 nodes by default and never more than 1000.
+
+```bash
+bun src/cli.ts graph --db ./memory.sqlite --out ./graph.json
+bun src/cli.ts graph-serve --db ./memory.sqlite
+```
+
+`graph-serve` listens on `http://127.0.0.1:4173`. Drag to pan, scroll to zoom, and hover a node for its text. The corner legend is recency (slate to amber) and the four edge colors.
+
+```bash
+bun test test/graph.test.ts
+```
+
 ### Extractors
 
 ```ts
