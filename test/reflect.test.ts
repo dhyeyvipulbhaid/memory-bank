@@ -310,7 +310,7 @@ test("opening a version 2 database adds observation tables and keeps facts", () 
   const facts = readRows<{ id: string; text: string }>(path, "SELECT id, text FROM facts");
   expect(facts).toEqual([{ id: "f1", text: FACT }]);
   const version = readRows<{ value: string }>(path, "SELECT value FROM schema_meta WHERE key = 'version'");
-  expect(version).toEqual([{ value: "3" }]);
+  expect(version).toEqual([{ value: "4" }]);
   expect(readRows(path, "SELECT id FROM observations")).toEqual([]);
   bank.close();
 });

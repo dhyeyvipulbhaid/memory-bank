@@ -1,6 +1,7 @@
 import type { Database } from "bun:sqlite";
 import { MemoryBankError } from "./errors.ts";
 import { displayName, matchStrength, nameTokens, normalizeName, type NameMatch } from "./names.ts";
+import { exactEntityIds, isSealed, openText, sealText, storedPlain, syncNameIndex } from "./sealed.ts";
 import { ENTITY_TYPES, type EntityRef, type EntityType } from "./types.ts";
 
 interface StoredEntity {
@@ -43,6 +44,12 @@ export function resolveMentions(db: Database, bankId: string, mentions: Mention[
   for (const index of order) {
     const mention = cleaned[index];
     if (!mention) continue;
+    const indexed = exactFromIndex(db, bankId, mention);
+    if (indexed) {
+      resolved[index] = indexed;
+      boundIds.push(indexed.id);
+      continue;
+    }
     const strong = choose(db, bankId, mention, boundIds, "strong");
     if (strong) {
       resolved[index] = strong;
@@ -203,16 +210,15 @@ function applyMatch(db: Database, bankId: string, candidate: Candidate, mention:
   }
 
   aliases = dedupeAliases(aliases, canonical);
-  db.query(
-    "UPDATE entities SET canonical_name = ?, aliases_json = ?, type = ? WHERE id = ? AND bank_id = ?",
-  ).run(canonical, JSON.stringify(aliases), type, candidate.entity.id, bankId);
-
+  saveEntityNames(db, bankId, candidate.entity.id, canonical, aliases, type);
   return { id: candidate.entity.id, name: canonical, type };
 }
 
 function createEntity(db: Database, bankId: string, mention: Mention): EntityRef {
+  const indexed = isSealed(db) ? new Set(exactEntityIds(db, bankId, mention.name)) : null;
   const existing = loadEntities(db, bankId).find(
     (entity) =>
+      (indexed == null || indexed.has(entity.id)) &&
       typesCompatible(mention.type, entity.type) &&
       normalizeName(entity.canonical_name) === normalizeName(mention.name),
   );
@@ -227,29 +233,84 @@ function createEntity(db: Database, bankId: string, mention: Mention): EntityRef
 
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
+  const nameSeal = sealText(db, "entities", "canonical_name", id, mention.name, normalizeName(mention.name));
   db.query(
-    `INSERT INTO entities (id, bank_id, canonical_name, aliases_json, type, created_at)
-     VALUES (?, ?, ?, '[]', ?, ?)`,
-  ).run(id, bankId, mention.name, mention.type, now);
+    `INSERT INTO entities (
+       id, bank_id, canonical_name, canonical_name_enc, aliases_json, aliases_enc, name_idx, type, created_at
+     ) VALUES (?, ?, ?, ?, '[]', NULL, ?, ?, ?)`,
+  ).run(id, bankId, storedPlain(db, mention.name, true), nameSeal.enc, nameSeal.index, mention.type, now);
+  syncNameIndex(db, bankId, id, mention.name, []);
   return { id, name: mention.name, type: mention.type };
+}
+
+function exactFromIndex(db: Database, bankId: string, mention: Mention): EntityRef | null {
+  if (!isSealed(db)) return null;
+  const ids = exactEntityIds(db, bankId, mention.name);
+  if (ids.length !== 1) return null;
+  const entity = loadEntities(db, bankId).find((row) => row.id === ids[0]);
+  if (!entity || !typesCompatible(mention.type, entity.type)) return null;
+  return applyMatch(
+    db,
+    bankId,
+    {
+      entity,
+      strength: "exact",
+      matchedCanonical: normalizeName(entity.canonical_name) === normalizeName(mention.name),
+    },
+    mention,
+  );
+}
+
+function saveEntityNames(
+  db: Database,
+  bankId: string,
+  id: string,
+  canonical: string,
+  aliases: string[],
+  type: EntityType,
+): void {
+  const nameSeal = sealText(db, "entities", "canonical_name", id, canonical, normalizeName(canonical));
+  const aliasPayload = JSON.stringify(aliases);
+  const aliasSeal = aliases.length > 0 ? sealText(db, "entities", "aliases", id, aliasPayload) : null;
+  db.query(
+    `UPDATE entities
+     SET canonical_name = ?, canonical_name_enc = ?, aliases_json = ?, aliases_enc = ?, name_idx = ?, type = ?
+     WHERE id = ? AND bank_id = ?`,
+  ).run(
+    storedPlain(db, canonical, true),
+    nameSeal.enc,
+    isSealed(db) ? "[]" : aliasPayload,
+    aliasSeal?.enc ?? null,
+    nameSeal.index,
+    type,
+    id,
+    bankId,
+  );
+  syncNameIndex(db, bankId, id, canonical, aliases);
 }
 
 function loadEntities(db: Database, bankId: string): StoredEntity[] {
   const rows = db
     .query(
-      "SELECT id, canonical_name, aliases_json, type FROM entities WHERE bank_id = ?",
+      `SELECT id, canonical_name, canonical_name_enc, aliases_json, aliases_enc, type
+       FROM entities WHERE bank_id = ?`,
     )
     .all(bankId) as Array<{
     id: string;
     canonical_name: string;
+    canonical_name_enc: unknown;
     aliases_json: string;
+    aliases_enc: unknown;
     type: string;
   }>;
 
   return rows.map((row) => ({
     id: row.id,
-    canonical_name: row.canonical_name,
-    aliases: parseAliases(row.aliases_json),
+    canonical_name:
+      openText(db, "entities", "canonical_name", row.id, row.canonical_name, row.canonical_name_enc, true) ?? "",
+    aliases: parseAliases(
+      openText(db, "entities", "aliases", row.id, row.aliases_json, row.aliases_enc, false) ?? "[]",
+    ),
     type: assertEntityType(row.type),
   }));
 }

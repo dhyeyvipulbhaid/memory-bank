@@ -1,6 +1,7 @@
 import type { Database } from "bun:sqlite";
 import { asEmbeddingBytes, decodeEmbedding } from "./embed.ts";
 import { MemoryBankError } from "./errors.ts";
+import { openBytes, openText } from "./sealed.ts";
 import { eventInstant } from "./time-window.ts";
 import type { FactKind, GraphEdge, GraphNode, GraphSnapshot, GraphSnapshotInput } from "./types.ts";
 
@@ -88,13 +89,14 @@ function loadNodes(
 ): RawNode[] {
   const facts = db
     .query(
-      `SELECT id, text, kind, occurrence_time, mentioned_at, embedding, embedding_dim
+      `SELECT id, text, text_enc, kind, occurrence_time, mentioned_at, embedding, embedding_dim
        FROM facts
        WHERE bank_id = ?`,
     )
     .all(bankId) as Array<{
     id: string;
     text: string;
+    text_enc: unknown;
     kind: string;
     occurrence_time: string | null;
     mentioned_at: string;
@@ -105,10 +107,10 @@ function loadNodes(
   for (const fact of facts) {
     const when = eventInstant(fact.occurrence_time, fact.mentioned_at);
     if (when == null || !inRange(when, since, until)) continue;
-    const vector = vectorOf(fact.embedding, fact.embedding_dim);
+    const vector = vectorOf(db, "facts", fact.id, fact.embedding, fact.embedding_dim);
     nodes.push({
       id: fact.id,
-      text: fact.text,
+      text: openText(db, "facts", "text", fact.id, fact.text, fact.text_enc, true) ?? "",
       kind: fact.kind as FactKind,
       mentionedAt: fact.mentioned_at,
       occurrenceTime: fact.occurrence_time,
@@ -123,13 +125,14 @@ function loadNodes(
 
   const observations = db
     .query(
-      `SELECT id, text, updated_at, embedding, embedding_dim
+      `SELECT id, text, text_enc, updated_at, embedding, embedding_dim
        FROM observations
        WHERE bank_id = ?`,
     )
     .all(bankId) as Array<{
     id: string;
     text: string;
+    text_enc: unknown;
     updated_at: string;
     embedding: unknown;
     embedding_dim: number | null;
@@ -138,10 +141,10 @@ function loadNodes(
   for (const observation of observations) {
     const when = Date.parse(observation.updated_at);
     if (Number.isNaN(when) || !inRange(when, since, until)) continue;
-    const vector = vectorOf(observation.embedding, observation.embedding_dim);
+    const vector = vectorOf(db, "observations", observation.id, observation.embedding, observation.embedding_dim);
     nodes.push({
       id: observation.id,
-      text: observation.text,
+      text: openText(db, "observations", "text", observation.id, observation.text, observation.text_enc, true) ?? "",
       kind: "observation",
       mentionedAt: observation.updated_at,
       occurrenceTime: null,
@@ -272,8 +275,8 @@ function undirected(
   return { source, target, type, weight };
 }
 
-function vectorOf(blob: unknown, dim: number | null): Float32Array | null {
-  const bytes = asEmbeddingBytes(blob);
+function vectorOf(db: Database, table: string, id: string, blob: unknown, dim: number | null): Float32Array | null {
+  const bytes = asEmbeddingBytes(openBytes(db, table, "embedding", id, blob));
   if (!bytes || dim == null) return null;
   return decodeEmbedding(bytes, dim);
 }

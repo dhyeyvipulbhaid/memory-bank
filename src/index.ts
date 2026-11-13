@@ -1,6 +1,9 @@
 export { MemoryBank, openBank } from "./bank.ts";
+export { parseEncryptionKey } from "./crypto.ts";
+export { encryptBank, type EncryptBankResult } from "./encrypt-bank.ts";
 export { estimateTokens } from "./tokens.ts";
 export {
+  EncryptionError,
   EmbedderUnavailableError,
   ExtractionFailedError,
   ExtractorUnavailableError,

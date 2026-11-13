@@ -2,6 +2,7 @@ import type { Database } from "bun:sqlite";
 import { asEmbeddingBytes, decodeEmbedding } from "./embed.ts";
 import { MemoryBankError } from "./errors.ts";
 import { assertEntityType } from "./resolve.ts";
+import { isSealed, openBytes, openText } from "./sealed.ts";
 import { estimateTokens } from "./tokens.ts";
 import type { FactKind, RecalledFact, RecallResult, VectorPoint, VectorRanker } from "./types.ts";
 
@@ -48,7 +49,7 @@ export function searchByVector(
 
   const rows = db
     .query(
-      `SELECT id, text, kind, occurrence_time, mentioned_at, source_id, embedding, embedding_dim
+      `SELECT id, text, text_enc, kind, occurrence_time, mentioned_at, source_id, embedding, embedding_dim
        FROM facts
        WHERE bank_id = ?
          AND embedding IS NOT NULL
@@ -60,7 +61,7 @@ export function searchByVector(
   const points: VectorPoint[] = [];
   const byId = new Map<string, VectorFactRow>();
   for (const row of rows) {
-    const bytes = asEmbeddingBytes(row.embedding);
+    const bytes = asEmbeddingBytes(openBytes(db, "facts", "embedding", row.id, row.embedding));
     if (!bytes) continue;
     const vector = decodeEmbedding(bytes, row.embedding_dim);
     if (!vector) continue;
@@ -81,7 +82,7 @@ export function searchByVector(
     if (!fact || hit.score <= 0) continue;
     ranked.push({
       id: fact.id,
-      text: fact.text,
+      text: openText(db, "facts", "text", fact.id, fact.text, (fact as VectorFactRow & { text_enc?: unknown }).text_enc, true) ?? "",
       kind: fact.kind as FactKind,
       occurrenceTime: fact.occurrence_time,
       mentionedAt: fact.mentioned_at,
@@ -123,19 +124,30 @@ function loadLinks(
     const marks = slice.map(() => "?").join(", ");
     const found = db
       .query(
-        `SELECT g.fact_id AS fact_id, e.id AS id, e.canonical_name AS name, e.type AS type
+        `SELECT g.fact_id AS fact_id, e.id AS id, e.canonical_name AS name,
+                e.canonical_name_enc AS name_enc, e.type AS type
          FROM edges g
          JOIN entities e ON e.id = g.entity_id AND e.bank_id = g.bank_id
          WHERE g.bank_id = ? AND g.edge_type = 'mentions' AND g.fact_id IN (${marks})
-         ORDER BY e.canonical_name`,
+         ORDER BY e.canonical_name, e.id`,
       )
-      .all(bankId, ...slice) as LinkRow[];
+      .all(bankId, ...slice) as Array<LinkRow & { name_enc: unknown }>;
     rows.push(...found);
   }
   for (const row of rows) {
     const list = links.get(row.fact_id) ?? [];
-    list.push({ id: row.id, name: row.name, type: assertEntityType(row.type) });
+    const stored = row as LinkRow & { name_enc?: unknown };
+    list.push({
+      id: stored.id,
+      name: openText(db, "entities", "canonical_name", stored.id, stored.name, stored.name_enc, true) ?? "",
+      type: assertEntityType(stored.type),
+    });
     links.set(row.fact_id, list);
+  }
+  if (isSealed(db)) {
+    for (const list of links.values()) {
+      list.sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : left.id < right.id ? -1 : 1));
+    }
   }
   return links;
 }

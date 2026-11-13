@@ -328,7 +328,34 @@ One SQLite file. Isolation column on every table: `bank_id`.
 | `facts` | `text`, `kind` (`world` or `experience`), `occurrence_time` (nullable), `mentioned_at`, `source_id`, `embedding` (float32 blob, nullable), `embedding_model`, `embedding_dim` |
 | `edges` | `edge_type` is `mentions`. A fact mentions an entity. |
 
-Opening a file from an older build adds the three embedding columns. Existing rows keep a null vector.
+Opening a file from an older build adds the embedding columns and the encryption columns. Existing rows stay plaintext until you run `encrypt`. Schema version 4 is the encryption columns and the `entity_name_index` table. A `schema_meta` row named `encryption` is the key check; it is written only when a key is in use.
+
+## Encryption at rest
+
+Field-level AES-256-GCM protects the SQLite file when it is sitting on disk. It does not protect a process that already has the key, and it does not hide row counts, timestamps, fact kinds, or the shape of the mention graph. Key management belongs to the host app (an OS keychain, for example). This library only receives the raw 32-byte key.
+
+`openBank({ encryptionKey })` takes that key as a `Uint8Array` or base64. Leave it unset and the file stays plaintext, including files written by older builds. A key on a brand-new empty file turns encryption on. A key on an existing plaintext file is refused, so plaintext and ciphertext are never mixed. A missing key on an encrypted file, or the wrong key, throws `EncryptionError` before any row is returned.
+
+Each value gets a fresh 12-byte IV. The stored blob is a version byte, the IV, the ciphertext, and the GCM tag. The associated data is the table, the column, and the row id, so a value copied onto another row fails authentication. Entity name and alias resolution, and exact fact dedup, compare a keyed HMAC-SHA256 (a separate HKDF subkey), not the plaintext. Keyword search, semantic search, `hybridRecall`, `reflect`, `sweepJunk`, and `graphSnapshot` decrypt in memory. That is fine for a few thousand facts and will get slower as the bank grows, because those scans can no longer use a SQL `LIKE` index.
+
+Generate a key:
+
+```bash
+bun -e 'console.log(Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64"))'
+```
+
+Put it in the environment, back up the file, then convert it. `--dry-run` only counts fields.
+
+```bash
+export MEMORY_BANK_KEY='the-base64-key'
+cp ./test.sqlite ./test.sqlite.bak
+bun src/cli.ts encrypt --db ./test.sqlite --key-env MEMORY_BANK_KEY --dry-run
+bun src/cli.ts encrypt --db ./test.sqlite --key-env MEMORY_BANK_KEY
+strings ./test.sqlite | grep -F 'a sentence you stored' || echo 'plaintext fact text is gone'
+bun src/cli.ts recall --db ./test.sqlite --key-env MEMORY_BANK_KEY --query 'Maya' --token-budget 200
+```
+
+Other commands take the same `--key-env`. `encryptBank(path, key)` is the library call. It is one transaction and it is safe to run again with the same key.
 
 ## Limits in v1
 
@@ -336,6 +363,6 @@ Extraction quality depends on the local model. The prompt asks for two to five c
 
 `recall` matches entity names and keywords. It will miss a paraphrase that shares neither. `hybridRecall` fuses that lookup with vectors, one-hop neighbors, and recency. `semanticSearch` is vectors alone. There is no approximate nearest-neighbor index. Identical fact text is stored once per bank. Paraphrases stay separate.
 
-Resolving a name loads that bank's entities. That is appropriate for a personal graph and will cost more if one bank grows very large.
+Resolving a name loads that bank's entities. That is appropriate for a personal graph and will cost more if one bank grows very large. On an encrypted bank, keyword search and that name scan decrypt rows in memory.
 
-There is no encryption and no hosted service.
+There is no hosted service. Encryption at rest is opt-in and covers the file, not the running process.

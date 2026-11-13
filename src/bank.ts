@@ -1,5 +1,6 @@
 import type { Database } from "bun:sqlite";
 import { chunkText } from "./chunk.ts";
+import { parseEncryptionKey } from "./crypto.ts";
 import { openDatabase } from "./db.ts";
 import { normalizeFactText } from "./dedupe.ts";
 import { createBruteForceCosineRanker, decodeEmbedding, prepareEmbedding } from "./embed.ts";
@@ -26,6 +27,7 @@ import { recallFacts } from "./recall.ts";
 import { createOllamaReranker, reorderByIds } from "./rerank.ts";
 import { assertEntityType, resolveMentions, type Mention } from "./resolve.ts";
 import { searchByVector } from "./semantic.ts";
+import { blindIndex, isSealed, openText, sealBytes, sealText, storedPlain } from "./sealed.ts";
 import { meaningfulTokens } from "./tokens.ts";
 import {
   FACT_KINDS,
@@ -329,11 +331,12 @@ export class MemoryBank {
     this.assertOpen();
     const dryRun = input.dryRun ?? true;
     const rows = this.db
-      .query("SELECT id, text FROM facts WHERE bank_id = ? ORDER BY id")
-      .all(this.bankId) as Array<{ id: string; text: string }>;
+      .query("SELECT id, text, text_enc FROM facts WHERE bank_id = ? ORDER BY id")
+      .all(this.bankId) as Array<{ id: string; text: string; text_enc: unknown }>;
     const candidates = rows.flatMap((row) => {
-      const reason = junkReason(row.text);
-      return reason == null ? [] : [{ id: row.id, text: row.text, reason }];
+      const text = openText(this.db, "facts", "text", row.id, row.text, row.text_enc, true) ?? "";
+      const reason = junkReason(text);
+      return reason == null ? [] : [{ id: row.id, text, reason }];
     });
     if (dryRun || candidates.length === 0) {
       return {
@@ -378,6 +381,7 @@ export class MemoryBank {
     if (input.kind != null && !FACT_KINDS.includes(input.kind)) {
       throw new MemoryBankError('kind must be "world" or "experience".');
     }
+    if (isSealed(this.db)) return listSealedFacts(this.db, this.bankId, input, offset);
     const where = ["f.bank_id = ?"];
     const params: Array<string | number> = [this.bankId];
     if (input.kind) {
@@ -442,30 +446,53 @@ export class MemoryBank {
                SET embedding = ?, embedding_model = ?, embedding_dim = ?
                WHERE id = ? AND bank_id = ? AND embedding IS NULL`,
             )
-            .run(vector.bytes, vector.model, vector.dim, duplicate.id, this.bankId);
+            .run(
+              sealBytes(this.db, "facts", "embedding", duplicate.id, vector.bytes),
+              vector.model,
+              vector.dim,
+              duplicate.id,
+              this.bankId,
+            );
         }
         removeFacts(this.db, this.bankId, [id]);
-        const kept = this.db
-          .query(
-            `SELECT id, text, kind, occurrence_time, mentioned_at, source_id
-             FROM facts WHERE id = ? AND bank_id = ?`,
-          )
-          .get(duplicate.id, this.bankId) as StoredFact;
+        const kept = revealStoredFact(
+          this.db,
+          this.db
+            .query(
+              `SELECT id, text, text_enc, kind, occurrence_time, mentioned_at, source_id
+               FROM facts WHERE id = ? AND bank_id = ?`,
+            )
+            .get(duplicate.id, this.bankId) as StoredFact & { text_enc: unknown },
+        );
         return { fact: factRecord(this.db, this.bankId, kept), mergedIntoExisting: true };
       }
+      const trimmed = next.trim();
+      const sealed = sealText(this.db, "facts", "text", id, trimmed, normalizeFactText(trimmed));
       this.db
         .query(
           `UPDATE facts
-           SET text = ?, embedding = ?, embedding_model = ?, embedding_dim = ?
+           SET text = ?, text_enc = ?, text_idx = ?, embedding = ?, embedding_model = ?, embedding_dim = ?
            WHERE id = ? AND bank_id = ?`,
         )
-        .run(next.trim(), vector?.bytes ?? null, vector?.model ?? null, vector?.dim ?? null, id, this.bankId);
-      const updated = this.db
-        .query(
-          `SELECT id, text, kind, occurrence_time, mentioned_at, source_id
-           FROM facts WHERE id = ? AND bank_id = ?`,
-        )
-        .get(id, this.bankId) as StoredFact;
+        .run(
+          sealed.text,
+          sealed.enc,
+          sealed.index,
+          vector ? sealBytes(this.db, "facts", "embedding", id, vector.bytes) : null,
+          vector?.model ?? null,
+          vector?.dim ?? null,
+          id,
+          this.bankId,
+        );
+      const updated = revealStoredFact(
+        this.db,
+        this.db
+          .query(
+            `SELECT id, text, text_enc, kind, occurrence_time, mentioned_at, source_id
+             FROM facts WHERE id = ? AND bank_id = ?`,
+          )
+          .get(id, this.bankId) as StoredFact & { text_enc: unknown },
+      );
       return { fact: factRecord(this.db, this.bankId, updated), mergedIntoExisting: false };
     });
     return write();
@@ -507,7 +534,7 @@ export class MemoryBank {
       rows = (
         this.db
           .query(
-            `SELECT id, text, kind, occurrence_time, mentioned_at
+            `SELECT id, text, text_enc, kind, occurrence_time, mentioned_at
              FROM facts
              WHERE bank_id = ?
              ORDER BY mentioned_at DESC
@@ -516,13 +543,14 @@ export class MemoryBank {
           .all(this.bankId) as Array<{
           id: string;
           text: string;
+          text_enc: unknown;
           kind: string;
           occurrence_time: string | null;
           mentioned_at: string;
         }>
       ).map((row) => ({
         id: row.id,
-        text: row.text,
+        text: openText(this.db, "facts", "text", row.id, row.text, row.text_enc, true) ?? "",
         kind: row.kind,
         mentionedAt: row.mentioned_at,
         occurrenceTime: row.occurrence_time,
@@ -587,23 +615,30 @@ export class MemoryBank {
     }
     const rows = this.db
       .query(
-        `SELECT id, text
+        `SELECT id, text, text_enc
          FROM facts
          WHERE bank_id = ? AND embedding IS NULL
          ORDER BY created_at ASC, id ASC`,
       )
-      .all(this.bankId) as Array<{ id: string; text: string }>;
+      .all(this.bankId) as Array<{ id: string; text: string; text_enc: unknown }>;
 
     let embedded = 0;
     for (const row of rows) {
-      const prepared = await this.prepareText(row.text);
+      const text = openText(this.db, "facts", "text", row.id, row.text, row.text_enc, true) ?? "";
+      const prepared = await this.prepareText(text);
       const result = this.db
         .query(
           `UPDATE facts
            SET embedding = ?, embedding_model = ?, embedding_dim = ?
            WHERE id = ? AND bank_id = ? AND embedding IS NULL`,
         )
-        .run(prepared.bytes, embedder.model, prepared.dim, row.id, this.bankId);
+        .run(
+          sealBytes(this.db, "facts", "embedding", row.id, prepared.bytes),
+          embedder.model,
+          prepared.dim,
+          row.id,
+          this.bankId,
+        );
       embedded += Number(result.changes);
     }
     return { embedded, remaining: this.countMissing() };
@@ -674,8 +709,9 @@ export function openBank(path: string, options: OpenBankOptions = {}): MemoryBan
   }
   const bankId = (options.bankId ?? "default").trim();
   if (!bankId) throw new MemoryBankError("bankId cannot be empty.");
+  const key = options.encryptionKey == null ? undefined : parseEncryptionKey(options.encryptionKey);
   return new MemoryBank(
-    openDatabase(path),
+    openDatabase(path, key),
     path,
     bankId,
     options.extractor,
@@ -756,15 +792,22 @@ function insertSource(
   source: { text: string; context?: string; speaker?: string; mentionedAt: string },
 ): string {
   const id = crypto.randomUUID();
+  const textSeal = sealText(db, "sources", "text", id, source.text);
+  const contextSeal = sealText(db, "sources", "context", id, source.context ?? null);
+  const speakerSeal = sealText(db, "sources", "speaker", id, source.speaker ?? null);
   db.query(
-    `INSERT INTO sources (id, bank_id, text, context, speaker, mentioned_at, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO sources (
+       id, bank_id, text, text_enc, context, context_enc, speaker, speaker_enc, mentioned_at, created_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     id,
     bankId,
-    source.text,
-    source.context ?? null,
-    source.speaker ?? null,
+    storedPlain(db, source.text, true),
+    textSeal.enc,
+    isSealed(db) ? null : (source.context ?? null),
+    contextSeal.enc,
+    isSealed(db) ? null : (source.speaker ?? null),
+    speakerSeal.enc,
     source.mentionedAt,
     new Date().toISOString(),
   );
@@ -773,11 +816,13 @@ function insertSource(
 
 function insertChunks(db: Database, bankId: string, sourceId: string, chunks: string[]): void {
   const statement = db.query(
-    `INSERT INTO source_chunks (id, bank_id, source_id, ordinal, text)
-     VALUES (?, ?, ?, ?, ?)`,
+    `INSERT INTO source_chunks (id, bank_id, source_id, ordinal, text, text_enc)
+     VALUES (?, ?, ?, ?, ?, ?)`,
   );
   chunks.forEach((text, ordinal) => {
-    statement.run(crypto.randomUUID(), bankId, sourceId, ordinal, text);
+    const id = crypto.randomUUID();
+    const sealed = sealText(db, "source_chunks", "text", id, text);
+    statement.run(id, bankId, sourceId, ordinal, storedPlain(db, text, true), sealed.enc);
   });
 }
 
@@ -809,7 +854,13 @@ function saveFact(
         `UPDATE facts
          SET embedding = ?, embedding_model = ?, embedding_dim = ?
          WHERE id = ? AND bank_id = ? AND embedding IS NULL`,
-      ).run(fact.vector.bytes, fact.vector.model, fact.vector.dim, existing.id, bankId);
+      ).run(
+        sealBytes(db, "facts", "embedding", existing.id, fact.vector.bytes),
+        fact.vector.model,
+        fact.vector.dim,
+        existing.id,
+        bankId,
+      );
     }
     return {
       id: existing.id,
@@ -824,21 +875,24 @@ function saveFact(
 
   const id = crypto.randomUUID();
   const text = fact.text.trim();
+  const sealed = sealText(db, "facts", "text", id, text, normalizeFactText(text));
   db.query(
     `INSERT INTO facts (
-       id, bank_id, text, kind, occurrence_time, mentioned_at, source_id, created_at,
+       id, bank_id, text, text_enc, text_idx, kind, occurrence_time, mentioned_at, source_id, created_at,
        embedding, embedding_model, embedding_dim
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     id,
     bankId,
-    text,
+    sealed.text,
+    sealed.enc,
+    sealed.index,
     fact.kind,
     fact.occurrenceTime,
     fact.mentionedAt,
     fact.sourceId,
     new Date().toISOString(),
-    fact.vector?.bytes ?? null,
+    fact.vector ? sealBytes(db, "facts", "embedding", id, fact.vector.bytes) : null,
     fact.vector?.model ?? null,
     fact.vector?.dim ?? null,
   );
@@ -871,6 +925,19 @@ function findIdenticalFact(
 ): StoredFact | null {
   const target = normalizeFactText(text);
   if (!target) return null;
+  if (isSealed(db)) {
+    const index = blindIndex(db, target);
+    const rows = db
+      .query(
+        `SELECT id, text, text_enc, kind, occurrence_time, mentioned_at, source_id
+         FROM facts
+         WHERE bank_id = ? AND text_idx = ?
+         ORDER BY created_at ASC, mentioned_at ASC, id ASC`,
+      )
+      .all(bankId, index) as Array<StoredFact & { text_enc: unknown }>;
+    const found = rows.find((row) => row.id !== exceptId);
+    return found ? revealStoredFact(db, found) : null;
+  }
   const rows = db
     .query(
       `SELECT id, text, kind, occurrence_time, mentioned_at, source_id
@@ -880,6 +947,17 @@ function findIdenticalFact(
     )
     .all(bankId) as StoredFact[];
   return rows.find((row) => row.id !== exceptId && normalizeFactText(row.text) === target) ?? null;
+}
+
+function revealStoredFact(db: Database, row: StoredFact & { text_enc?: unknown }): StoredFact {
+  return {
+    id: row.id,
+    text: openText(db, "facts", "text", row.id, row.text, row.text_enc, true) ?? "",
+    kind: row.kind,
+    occurrence_time: row.occurrence_time,
+    mentioned_at: row.mentioned_at,
+    source_id: row.source_id,
+  };
 }
 
 function factRecord(db: Database, bankId: string, row: StoredFact): FactRecord {
@@ -948,16 +1026,91 @@ function linkMentions(
 function entitiesForFact(db: Database, bankId: string, factId: string): FactRecord["entities"] {
   const rows = db
     .query(
-      `SELECT e.id AS id, e.canonical_name AS name, e.type AS type
+      `SELECT e.id AS id, e.canonical_name AS name, e.canonical_name_enc AS name_enc, e.type AS type
        FROM edges g
        JOIN entities e ON e.id = g.entity_id AND e.bank_id = g.bank_id
        WHERE g.bank_id = ? AND g.edge_type = 'mentions' AND g.fact_id = ?
        ORDER BY e.canonical_name, e.id`,
     )
-    .all(bankId, factId) as Array<{ id: string; name: string; type: string }>;
-  return rows.map((row) => ({
+    .all(bankId, factId) as Array<{ id: string; name: string; name_enc: unknown; type: string }>;
+  const entities = rows.map((row) => ({
     id: row.id,
-    name: row.name,
+    name: openText(db, "entities", "canonical_name", row.id, row.name, row.name_enc, true) ?? "",
     type: assertEntityType(row.type),
   }));
+  if (!isSealed(db)) return entities;
+  return entities.sort((left, right) => {
+    if (left.name !== right.name) return left.name < right.name ? -1 : 1;
+    return left.id < right.id ? -1 : 1;
+  });
+}
+
+function listSealedFacts(
+  db: Database,
+  bankId: string,
+  input: ListFactsInput,
+  offset: number,
+): ListFactsResult {
+  const where = ["bank_id = ?"];
+  const params: Array<string | number> = [bankId];
+  if (input.kind) {
+    where.push("kind = ?");
+    params.push(input.kind);
+  }
+  const rows = db
+    .query(
+      `SELECT id, text, text_enc, kind, occurrence_time, mentioned_at, source_id
+       FROM facts
+       WHERE ${where.join(" AND ")}
+       ORDER BY mentioned_at DESC, id ASC`,
+    )
+    .all(...params) as Array<StoredFact & { text_enc: unknown }>;
+  let facts = rows.map((row) => revealStoredFact(db, row));
+  const entity = input.entity?.trim();
+  if (entity) {
+    const ids = entityIdsMatching(db, bankId, entity);
+    facts = facts.filter((row) => factMentionsEntity(db, bankId, row.id, ids));
+  }
+  const tokens = meaningfulTokens(input.query ?? "");
+  if (tokens.length > 0) {
+    facts = facts.filter((row) => tokens.every((token) => row.text.toLowerCase().includes(token)));
+  }
+  return {
+    facts: facts.slice(offset, offset + input.limit).map((row) => factRecord(db, bankId, row)),
+    total: facts.length,
+  };
+}
+
+function entityIdsMatching(db: Database, bankId: string, entity: string): Set<string> {
+  const needle = entity.toLowerCase();
+  const rows = db
+    .query(
+      `SELECT id, canonical_name, canonical_name_enc, aliases_json, aliases_enc
+       FROM entities WHERE bank_id = ?`,
+    )
+    .all(bankId) as Array<{
+    id: string;
+    canonical_name: string;
+    canonical_name_enc: unknown;
+    aliases_json: string;
+    aliases_enc: unknown;
+  }>;
+  const ids = new Set<string>();
+  for (const row of rows) {
+    const name = openText(db, "entities", "canonical_name", row.id, row.canonical_name, row.canonical_name_enc, true) ?? "";
+    const aliases = openText(db, "entities", "aliases", row.id, row.aliases_json, row.aliases_enc, false) ?? "[]";
+    if (name.toLowerCase() === needle || aliases.toLowerCase().includes(needle)) ids.add(row.id);
+  }
+  return ids;
+}
+
+function factMentionsEntity(db: Database, bankId: string, factId: string, entityIds: Set<string>): boolean {
+  if (entityIds.size === 0) return false;
+  const rows = db
+    .query(
+      `SELECT entity_id FROM edges
+       WHERE bank_id = ? AND edge_type = 'mentions' AND fact_id = ?`,
+    )
+    .all(bankId, factId) as Array<{ entity_id: string }>;
+  return rows.some((row) => entityIds.has(row.entity_id));
 }
