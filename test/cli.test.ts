@@ -209,6 +209,36 @@ test("remember stores the fact when the embed server is down", async () => {
   expect(body.facts.map((fact) => fact.text)).toEqual(["Nia keeps a red notebook."]);
 });
 
+test("hybrid recall from the CLI finds a keyword fact without an embedder", async () => {
+  const db = join(tempDir(), "memory.sqlite");
+  const saved = await run([
+    "remember",
+    "--no-embed",
+    "--db",
+    db,
+    "--text",
+    "Nia keeps a red notebook.",
+    "--mentioned-at",
+    "2024-08-01T00:00:00.000Z",
+  ]);
+  expect(saved.code).toBe(0);
+
+  const hybrid = await run([
+    "hybrid",
+    "--no-embed",
+    "--db",
+    db,
+    "--query",
+    "Nia notebook",
+    "--token-budget",
+    "40",
+  ]);
+  expect(hybrid.code).toBe(0);
+  const body = JSON.parse(hybrid.stdout) as { facts: Array<{ text: string; breakdown: { vector: number } }> };
+  expect(body.facts.map((fact) => fact.text)).toEqual(["Nia keeps a red notebook."]);
+  expect(body.facts[0]?.breakdown.vector).toBe(0);
+});
+
 test("missing command prints usage", async () => {
   const result = await run([]);
   expect(result.code).toBe(1);

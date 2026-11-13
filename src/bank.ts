@@ -5,8 +5,16 @@ import { normalizeFactText } from "./dedupe.ts";
 import { createBruteForceCosineRanker, prepareEmbedding } from "./embed.ts";
 import { EmbedderUnavailableError, MemoryBankError } from "./errors.ts";
 import { normalizeExtractedFacts } from "./extract/validate.ts";
+import {
+  DEFAULT_HALF_LIFE_DAYS,
+  DEFAULT_HYBRID_WEIGHTS,
+  DEFAULT_RRF_K,
+  packHybridFacts,
+  rankHybridFacts,
+} from "./hybrid.ts";
 import { isAssistantKnowledgeGap } from "./knowledge-gap.ts";
 import { recallFacts } from "./recall.ts";
+import { createOllamaReranker, reorderByIds } from "./rerank.ts";
 import { assertEntityType, resolveMentions, type Mention } from "./resolve.ts";
 import { searchByVector } from "./semantic.ts";
 import {
@@ -23,6 +31,9 @@ import {
   type RememberInput,
   type RetainInput,
   type RetainResult,
+  type HybridRecallInput,
+  type HybridRecallResult,
+  type Reranker,
   type SemanticSearchInput,
   type VectorRanker,
 } from "./types.ts";
@@ -37,6 +48,7 @@ export class MemoryBank {
     private readonly extractor: Extractor | undefined,
     private readonly embedder: Embedder | undefined,
     private readonly ranker: VectorRanker,
+    private readonly reranker: Reranker | undefined,
   ) {}
 
   async retain(input: RetainInput): Promise<RetainResult> {
@@ -129,6 +141,80 @@ export class MemoryBank {
       throw new MemoryBankError("query must be a string.");
     }
     return recallFacts(this.db, this.bankId, input.query, input.tokenBudget);
+  }
+
+  /**
+   * Keyword, vector, and one-hop graph lists fused with reciprocal rank fusion,
+   * then ordered by recency. Personal-Agents should call this. `recall` stays
+   * the keyword and entity path.
+   */
+  async hybridRecall(input: HybridRecallInput): Promise<HybridRecallResult> {
+    this.assertOpen();
+    if (typeof input.query !== "string") {
+      throw new MemoryBankError("query must be a string.");
+    }
+    const weights = {
+      keyword: input.weights?.keyword ?? DEFAULT_HYBRID_WEIGHTS.keyword,
+      vector: input.weights?.vector ?? DEFAULT_HYBRID_WEIGHTS.vector,
+      graph: input.weights?.graph ?? DEFAULT_HYBRID_WEIGHTS.graph,
+    };
+    for (const value of [weights.keyword, weights.vector, weights.graph]) {
+      if (!Number.isFinite(value) || value < 0) {
+        throw new MemoryBankError("weights must be finite numbers of zero or more.");
+      }
+    }
+    const rrfK = input.rrfK ?? DEFAULT_RRF_K;
+    if (!Number.isFinite(rrfK) || rrfK <= 0) {
+      throw new MemoryBankError("rrfK must be a finite number greater than zero.");
+    }
+    const halfLifeDays = input.halfLifeDays ?? DEFAULT_HALF_LIFE_DAYS;
+    if (!Number.isFinite(halfLifeDays) || halfLifeDays <= 0) {
+      throw new MemoryBankError("halfLifeDays must be a finite number greater than zero.");
+    }
+    if (input.limit != null && (!Number.isInteger(input.limit) || input.limit < 0)) {
+      throw new MemoryBankError("limit must be an integer of zero or more.");
+    }
+    if (!Number.isFinite(input.tokenBudget) || input.tokenBudget < 0) {
+      throw new MemoryBankError("tokenBudget must be a finite number of zero or more.");
+    }
+    const now = resolveNow(input.now);
+
+    let queryVector: Float32Array | null = null;
+    if (this.embedder && input.query.trim() !== "") {
+      try {
+        queryVector = (await this.prepareText(input.query)).vector;
+      } catch {
+        queryVector = null;
+      }
+    }
+
+    let ranked = rankHybridFacts(this.db, this.bankId, {
+      query: input.query,
+      tokenBudget: input.tokenBudget,
+      limit: input.limit,
+      weights,
+      rrfK,
+      halfLifeDays,
+      now,
+      queryVector,
+      vectorModel: this.embedder?.model ?? null,
+      ranker: this.ranker,
+    });
+
+    if (input.llmRerank && ranked.length > 1) {
+      const reranker = this.reranker ?? createOllamaReranker();
+      try {
+        const ids = await reranker.rerank({
+          query: input.query,
+          facts: ranked.map((fact) => ({ id: fact.id, text: fact.text })),
+        });
+        ranked = reorderByIds(ranked, ids);
+      } catch {
+        // Fusion order stands when the reranker cannot answer.
+      }
+    }
+
+    return packHybridFacts(ranked, input.tokenBudget, input.limit);
   }
 
   async semanticSearch(input: SemanticSearchInput): Promise<RecallResult> {
@@ -274,7 +360,15 @@ export function openBank(path: string, options: OpenBankOptions = {}): MemoryBan
     options.extractor,
     options.embedder ?? undefined,
     options.vectorRanker ?? createBruteForceCosineRanker(),
+    options.reranker ?? undefined,
   );
+}
+
+function resolveNow(value: string | Date | undefined): Date {
+  if (value == null) return new Date();
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) throw new MemoryBankError(`Invalid time: ${String(value)}`);
+  return date;
 }
 
 const MAX_RETAINED_FACTS = 5;
