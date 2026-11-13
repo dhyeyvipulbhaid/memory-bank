@@ -75,6 +75,7 @@ Opens or creates one SQLite file and returns a `MemoryBank`.
 
 - `options.bankId` defaults to `"default"`. Every row is stored with that id, and every read filters on it. Two bank ids in one file cannot see each other's facts or entities. Two files are separate as well.
 - `options.extractor` is required for `retain`. `remember` and `recall` work without one.
+- Opening a file merges leftover facts that match under the same normalization in the same `bank_id`. The oldest row is kept, its mentions stay, mentions from the copies are moved onto it, and the extra fact rows are deleted. A stored occurrence time is kept. If the oldest row has none and a copy has one, that time is copied over. Sources are left in place. Another bank id in the file is not merged into this one.
 
 ### `retain({ content, context?, mentionedAt?, speaker? })`
 
@@ -84,9 +85,11 @@ Each fact is `world` (about other people or things) or `experience` (the agent's
 
 Returns `{ sourceId, facts }`.
 
+If this bank already has a fact with the same text, after trimming, collapsing whitespace, and ignoring case, that row is reused. The id, wording, kind, mentioned time, and source id stay as they were. Entity mentions from the new write are still resolved and attached. A null `occurrenceTime` can be filled when the new write has one. A stored `occurrenceTime` is left unchanged, including when the new write has null. The later chat is still saved as its own source. The same text in another bank id is a different fact. A different sentence that only shares a word or an entity is also a different fact.
+
 ### `remember({ text, kind?, entities?, occurrenceTime?, mentionedAt? })`
 
-Saves one fact directly. `kind` defaults to `"world"`. Entity `type` defaults to `"other"`. No model is called.
+Saves one fact directly. `kind` defaults to `"world"`. Entity `type` defaults to `"other"`. No model is called. Repeating the same text, aside from case and whitespace, reuses the existing fact in this bank instead of inserting another row. The original mentioned time is kept. The later write is still stored as a source.
 
 Names are resolved against the bank:
 
@@ -173,7 +176,7 @@ One SQLite file. Isolation column on every table: `bank_id`.
 
 Extraction quality depends on the local model. The prompt asks for two to five coarse facts, and the bank keeps at most five. A small model may miss a fact, invent a detail, or choose a weak name. That is accepted for this version.
 
-Recall matches entity names and keywords. It will miss a paraphrase that shares neither. There is no vector index.
+Recall matches entity names and keywords. It will miss a paraphrase that shares neither. Identical fact text is stored once per bank. Paraphrases stay separate. There is no vector index.
 
 Resolving a name loads that bank's entities. That is appropriate for a personal graph and will cost more if one bank grows very large.
 

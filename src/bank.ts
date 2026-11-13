@@ -1,6 +1,7 @@
 import type { Database } from "bun:sqlite";
 import { chunkText } from "./chunk.ts";
 import { openDatabase } from "./db.ts";
+import { normalizeFactText } from "./dedupe.ts";
 import { MemoryBankError } from "./errors.ts";
 import { normalizeExtractedFacts } from "./extract/validate.ts";
 import { recallFacts } from "./recall.ts";
@@ -230,34 +231,114 @@ function saveFact(
   },
 ): FactRecord {
   const entities = resolveMentions(db, bankId, fact.mentions);
+  const existing = findIdenticalFact(db, bankId, fact.text);
+  if (existing) {
+    linkMentions(db, bankId, existing.id, entities);
+    return {
+      id: existing.id,
+      text: existing.text,
+      kind: existing.kind as FactKind,
+      occurrenceTime: fillOccurrenceTime(db, bankId, existing, fact.occurrenceTime),
+      mentionedAt: existing.mentioned_at,
+      sourceId: existing.source_id,
+      entities: entitiesForFact(db, bankId, existing.id),
+    };
+  }
+
   const id = crypto.randomUUID();
+  const text = fact.text.trim();
   db.query(
     `INSERT INTO facts (id, bank_id, text, kind, occurrence_time, mentioned_at, source_id, created_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     id,
     bankId,
-    fact.text.trim(),
+    text,
     fact.kind,
     fact.occurrenceTime,
     fact.mentionedAt,
     fact.sourceId,
     new Date().toISOString(),
   );
-  const link = db.query(
-    `INSERT INTO edges (id, bank_id, edge_type, fact_id, entity_id)
-     VALUES (?, ?, 'mentions', ?, ?)`,
-  );
-  for (const entity of entities) {
-    link.run(crypto.randomUUID(), bankId, id, entity.id);
-  }
+  linkMentions(db, bankId, id, entities);
   return {
     id,
-    text: fact.text.trim(),
+    text,
     kind: fact.kind,
     occurrenceTime: fact.occurrenceTime,
     mentionedAt: fact.mentionedAt,
     sourceId: fact.sourceId,
     entities,
   };
+}
+
+interface StoredFact {
+  id: string;
+  text: string;
+  kind: string;
+  occurrence_time: string | null;
+  mentioned_at: string;
+  source_id: string;
+}
+
+function findIdenticalFact(db: Database, bankId: string, text: string): StoredFact | null {
+  const target = normalizeFactText(text);
+  if (!target) return null;
+  const rows = db
+    .query(
+      `SELECT id, text, kind, occurrence_time, mentioned_at, source_id
+       FROM facts
+       WHERE bank_id = ?
+       ORDER BY created_at ASC, mentioned_at ASC, id ASC`,
+    )
+    .all(bankId) as StoredFact[];
+  return rows.find((row) => normalizeFactText(row.text) === target) ?? null;
+}
+
+function fillOccurrenceTime(
+  db: Database,
+  bankId: string,
+  existing: StoredFact,
+  incoming: string | null,
+): string | null {
+  if (existing.occurrence_time != null) return existing.occurrence_time;
+  if (incoming == null) return null;
+  db.query(
+    `UPDATE facts
+     SET occurrence_time = ?
+     WHERE id = ? AND bank_id = ? AND occurrence_time IS NULL`,
+  ).run(incoming, existing.id, bankId);
+  return incoming;
+}
+
+function linkMentions(
+  db: Database,
+  bankId: string,
+  factId: string,
+  entities: FactRecord["entities"],
+): void {
+  const link = db.query(
+    `INSERT OR IGNORE INTO edges (id, bank_id, edge_type, fact_id, entity_id)
+     VALUES (?, ?, 'mentions', ?, ?)`,
+  );
+  for (const entity of entities) {
+    link.run(crypto.randomUUID(), bankId, factId, entity.id);
+  }
+}
+
+function entitiesForFact(db: Database, bankId: string, factId: string): FactRecord["entities"] {
+  const rows = db
+    .query(
+      `SELECT e.id AS id, e.canonical_name AS name, e.type AS type
+       FROM edges g
+       JOIN entities e ON e.id = g.entity_id AND e.bank_id = g.bank_id
+       WHERE g.bank_id = ? AND g.edge_type = 'mentions' AND g.fact_id = ?
+       ORDER BY e.canonical_name, e.id`,
+    )
+    .all(bankId, factId) as Array<{ id: string; name: string; type: string }>;
+  return rows.map((row) => ({
+    id: row.id,
+    name: row.name,
+    type: assertEntityType(row.type),
+  }));
 }
