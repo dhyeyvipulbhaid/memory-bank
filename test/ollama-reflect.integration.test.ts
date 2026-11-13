@@ -37,4 +37,5 @@ test.skipIf(process.env.MEMORY_BANK_OLLAMA_TEST !== "1")(
     }
     bank.close();
   },
+  { timeout: 120_000 },
 );

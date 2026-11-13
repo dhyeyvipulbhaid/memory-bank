@@ -2,7 +2,18 @@ import type { Database } from "bun:sqlite";
 import { normalizeFactText } from "./dedupe.ts";
 import { ReflectFailedError } from "./errors.ts";
 import { isAssistantKnowledgeGap } from "./knowledge-gap.ts";
+import { meaningfulTokens } from "./tokens.ts";
 import type { ObservationDraft, ObservationRecord } from "./types.ts";
+
+/** Token overlap above this is the same observation said twice. */
+const TEXT_SIMILARITY = 0.55;
+/** Embedding cosine at or above this is the same observation. */
+const VECTOR_SIMILARITY = 0.85;
+
+const SPECULATIVE =
+  /\b(?:suggest(?:s|ed|ing)?|indicat(?:e|es|ed|ing)|seem(?:s|ed|ing)?|appear(?:s|ed|ing)?|might|may|possibly|probably|likely|perhaps|could)\b/i;
+const META =
+  /\b(?:separate from|separately from|mentioned in the context|in the context of|unrelated to|distinct from|as opposed to|not related to)\b/i;
 
 export const MAX_OBSERVATIONS = 5;
 
@@ -28,28 +39,86 @@ export function acceptObservations(
   drafts: readonly ObservationDraft[],
   allowedIds: ReadonlySet<string>,
   maxObservations: number,
+  options: { singleEntity?: boolean; vectors?: ReadonlyMap<string, readonly number[]> } = {},
 ): ObservationDraft[] {
+  const requireTwo = options.singleEntity !== true && allowedIds.size >= 2;
   const accepted: ObservationDraft[] = [];
-  const seen = new Set<string>();
   for (const draft of drafts) {
-    if (accepted.length >= maxObservations) break;
     const text = draft.text.trim();
     const key = normalizeFactText(text);
-    if (!key || seen.has(key)) continue;
-    if (isAssistantKnowledgeGap(text)) continue;
+    if (!key) continue;
+    if (isAssistantKnowledgeGap(text) || isLowValueObservation(text)) continue;
     if (!Number.isFinite(draft.confidence) || draft.confidence < 0 || draft.confidence > 1) continue;
     const sourceFactIds = [...new Set(draft.sourceFactIds)];
     if (sourceFactIds.length === 0) continue;
     if (sourceFactIds.some((id) => !allowedIds.has(id))) continue;
-    seen.add(key);
+    if (requireTwo && sourceFactIds.length < 2) continue;
     accepted.push({ text, confidence: draft.confidence, sourceFactIds });
   }
-  if (accepted.length === 0) {
+  const unique = dropNearDuplicates(accepted, options.vectors);
+  if (unique.length === 0) {
     throw new ReflectFailedError(
       "Reflector returned no observation that cites the gathered facts. Nothing was written.",
     );
   }
-  return accepted;
+  return unique.slice(0, maxObservations);
+}
+
+/** Meta comments and hedged guesses are not observations. */
+export function isLowValueObservation(text: string): boolean {
+  return SPECULATIVE.test(text) || META.test(text);
+}
+
+function dropNearDuplicates(
+  drafts: readonly ObservationDraft[],
+  vectors: ReadonlyMap<string, readonly number[]> | undefined,
+): ObservationDraft[] {
+  const ranked = [...drafts].sort((left, right) => right.confidence - left.confidence);
+  const kept: ObservationDraft[] = [];
+  for (const draft of ranked) {
+    const duplicate = kept.some((prior) => sameObservation(prior, draft, vectors));
+    if (!duplicate) kept.push(draft);
+  }
+  return kept;
+}
+
+function sameObservation(
+  left: ObservationDraft,
+  right: ObservationDraft,
+  vectors: ReadonlyMap<string, readonly number[]> | undefined,
+): boolean {
+  if (normalizeFactText(left.text) === normalizeFactText(right.text)) return true;
+  if (tokenSimilarity(left.text, right.text) >= TEXT_SIMILARITY) return true;
+  const leftVector = vectors?.get(normalizeFactText(left.text));
+  const rightVector = vectors?.get(normalizeFactText(right.text));
+  if (leftVector && rightVector && cosine(leftVector, rightVector) >= VECTOR_SIMILARITY) return true;
+  return false;
+}
+
+function tokenSimilarity(left: string, right: string): number {
+  const a = new Set(meaningfulTokens(left));
+  const b = new Set(meaningfulTokens(right));
+  if (a.size === 0 || b.size === 0) return 0;
+  let shared = 0;
+  for (const token of a) if (b.has(token)) shared += 1;
+  return shared / (a.size + b.size - shared);
+}
+
+function cosine(left: readonly number[], right: readonly number[]): number {
+  if (left.length === 0 || left.length !== right.length) return 0;
+  let dot = 0;
+  let leftNorm = 0;
+  let rightNorm = 0;
+  for (let index = 0; index < left.length; index++) {
+    const a = left[index] ?? 0;
+    const b = right[index] ?? 0;
+    dot += a * b;
+    leftNorm += a * a;
+    rightNorm += b * b;
+  }
+  const magnitude = Math.sqrt(leftNorm) * Math.sqrt(rightNorm);
+  if (magnitude === 0) return 0;
+  return dot / magnitude;
 }
 
 export function scopeKey(parts: {
