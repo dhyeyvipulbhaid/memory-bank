@@ -2,6 +2,7 @@ import type { Database } from "bun:sqlite";
 import { normalizeFactText } from "./dedupe.ts";
 import { MemoryBankError, ReflectFailedError } from "./errors.ts";
 import { isAssistantKnowledgeGap } from "./knowledge-gap.ts";
+import { asBytes, blindIndex, isSealed, sealBytes, sealText, storedScope } from "./sealed.ts";
 import { meaningfulTokens } from "./tokens.ts";
 import type { ObservationDraft, ObservationRecord } from "./types.ts";
 
@@ -26,6 +27,8 @@ export interface StoredObservationVector {
 interface ObservationRow {
   id: string;
   text: string;
+  text_enc: unknown;
+  text_idx: unknown;
   confidence: number;
   created_at: string;
   updated_at: string;
@@ -141,26 +144,27 @@ export function saveObservations(
   vectors: ReadonlyMap<string, StoredObservationVector | null>,
   now: string,
 ): { observations: ObservationRecord[]; removedIds: string[] } {
+  const scopeStored = storedScope(db, scope);
   const existing = db
     .query(
-      `SELECT id, text, confidence, created_at, updated_at
+      `SELECT id, text, text_enc, text_idx, confidence, created_at, updated_at
        FROM observations
        WHERE bank_id = ? AND scope_key = ?`,
     )
-    .all(bankId, scope) as ObservationRow[];
-  const byText = new Map(existing.map((row) => [normalizeFactText(row.text), row]));
+    .all(bankId, scopeStored) as ObservationRow[];
+  const byText = new Map(existing.map((row) => [observationKey(db, row), row]));
   const kept = new Set<string>();
   const observations: ObservationRecord[] = [];
 
   const insert = db.query(
     `INSERT INTO observations (
-       id, bank_id, scope_key, text, confidence, created_at, updated_at,
+       id, bank_id, scope_key, text, text_enc, text_idx, confidence, created_at, updated_at,
        embedding, embedding_model, embedding_dim
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   );
   const update = db.query(
     `UPDATE observations
-     SET text = ?, confidence = ?, updated_at = ?,
+     SET text = ?, text_enc = ?, text_idx = ?, confidence = ?, updated_at = ?,
          embedding = ?, embedding_model = ?, embedding_dim = ?
      WHERE id = ? AND bank_id = ?`,
   );
@@ -174,15 +178,19 @@ export function saveObservations(
   const write = db.transaction(() => {
     for (const draft of drafts) {
       const vector = vectors.get(normalizeFactText(draft.text)) ?? null;
-      const prior = byText.get(normalizeFactText(draft.text));
+      const prior = byText.get(observationKey(db, { text: draft.text, text_idx: null }));
       const id = prior?.id ?? crypto.randomUUID();
       const createdAt = prior?.created_at ?? now;
+      const sealed = sealText(db, "observations", "text", id, draft.text, normalizeFactText(draft.text));
+      const embedding = vector ? sealBytes(db, "observations", "embedding", id, vector.bytes) : null;
       if (prior) {
         update.run(
-          draft.text,
+          sealed.text,
+          sealed.enc,
+          sealed.index,
           draft.confidence,
           now,
-          vector?.bytes ?? null,
+          embedding,
           vector?.model ?? null,
           vector?.dim ?? null,
           id,
@@ -192,12 +200,14 @@ export function saveObservations(
         insert.run(
           id,
           bankId,
-          scope,
-          draft.text,
+          scopeStored,
+          sealed.text,
+          sealed.enc,
+          sealed.index,
           draft.confidence,
           createdAt,
           now,
-          vector?.bytes ?? null,
+          embedding,
           vector?.model ?? null,
           vector?.dim ?? null,
         );
@@ -226,6 +236,14 @@ export function saveObservations(
     return { observations, removedIds };
   });
   return write();
+}
+
+function observationKey(db: Database, row: { text: string; text_idx: unknown }): string {
+  if (!isSealed(db)) return normalizeFactText(row.text);
+  const stored = asBytes(row.text_idx);
+  if (stored) return Buffer.from(stored).toString("hex");
+  const index = blindIndex(db, normalizeFactText(row.text));
+  return index ? Buffer.from(index).toString("hex") : normalizeFactText(row.text);
 }
 
 /** Drop citation rows whose fact is gone, then drop observations with no citations left. */

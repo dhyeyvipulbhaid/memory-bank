@@ -5,6 +5,14 @@ export class MemoryBankError extends Error {
   }
 }
 
+/** The database key is missing, wrong, or the ciphertext was modified. */
+export class EncryptionError extends MemoryBankError {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "EncryptionError";
+  }
+}
+
 /** Ollama could not be reached. retain did not write. */
 export class ExtractorUnavailableError extends MemoryBankError {
   constructor(message: string, options?: { cause?: unknown }) {

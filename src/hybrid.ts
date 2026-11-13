@@ -3,6 +3,7 @@ import { asEmbeddingBytes, decodeEmbedding } from "./embed.ts";
 import { MemoryBankError } from "./errors.ts";
 import { normalizeName } from "./names.ts";
 import { assertEntityType } from "./resolve.ts";
+import { isSealed, openBytes, openText } from "./sealed.ts";
 import { estimateTokens, meaningfulTokens, tokenize } from "./tokens.ts";
 import { eventInstant, inTimeWindow, parseTimeWindow } from "./time-window.ts";
 import type {
@@ -163,14 +164,16 @@ export function packHybridFacts(
 function loadMemoryRows(db: Database, bankId: string, includeObservations: boolean): FactRow[] {
   const stored = db
     .query(
-      `SELECT id, text, kind, occurrence_time, mentioned_at, source_id,
+      `SELECT id, text, text_enc, kind, occurrence_time, mentioned_at, source_id,
               embedding, embedding_model, embedding_dim
        FROM facts
        WHERE bank_id = ?`,
     )
-    .all(bankId) as Array<Omit<FactRow, "derived" | "confidence" | "sourceFactIds">>;
+    .all(bankId) as Array<Omit<FactRow, "derived" | "confidence" | "sourceFactIds"> & { text_enc: unknown }>;
   const facts: FactRow[] = stored.map((row) => ({
     ...row,
+    text: openText(db, "facts", "text", row.id, row.text, row.text_enc, true) ?? "",
+    embedding: openBytes(db, "facts", "embedding", row.id, row.embedding),
     derived: false,
     confidence: null,
     sourceFactIds: [],
@@ -179,13 +182,14 @@ function loadMemoryRows(db: Database, bankId: string, includeObservations: boole
 
   const observations = db
     .query(
-      `SELECT id, text, confidence, updated_at, embedding, embedding_model, embedding_dim
+      `SELECT id, text, text_enc, confidence, updated_at, embedding, embedding_model, embedding_dim
        FROM observations
        WHERE bank_id = ?`,
     )
     .all(bankId) as Array<{
     id: string;
     text: string;
+    text_enc: unknown;
     confidence: number;
     updated_at: string;
     embedding: unknown;
@@ -209,12 +213,12 @@ function loadMemoryRows(db: Database, bankId: string, includeObservations: boole
   for (const observation of observations) {
     facts.push({
       id: observation.id,
-      text: observation.text,
+      text: openText(db, "observations", "text", observation.id, observation.text, observation.text_enc, true) ?? "",
       kind: "observation",
       occurrence_time: null,
       mentioned_at: observation.updated_at,
       source_id: observation.id,
-      embedding: observation.embedding,
+      embedding: openBytes(db, "observations", "embedding", observation.id, observation.embedding),
       embedding_model: observation.embedding_model,
       embedding_dim: observation.embedding_dim,
       derived: true,
@@ -371,18 +375,30 @@ function loadLinks(db: Database, bankId: string): Map<string, LinkRow[]> {
   const rows = db
     .query(
       `SELECT g.fact_id AS fact_id, e.id AS id, e.canonical_name AS name, e.type AS type,
-              e.aliases_json AS aliases_json
+              e.canonical_name_enc AS name_enc, e.aliases_json AS aliases_json, e.aliases_enc AS aliases_enc
        FROM edges g
        JOIN entities e ON e.id = g.entity_id AND e.bank_id = g.bank_id
        WHERE g.bank_id = ? AND g.edge_type = 'mentions'
-       ORDER BY e.canonical_name`,
+       ORDER BY e.canonical_name, e.id`,
     )
-    .all(bankId) as LinkRow[];
+    .all(bankId) as Array<LinkRow & { name_enc: unknown; aliases_enc: unknown }>;
   const links = new Map<string, LinkRow[]>();
   for (const row of rows) {
+    const revealed: LinkRow = {
+      fact_id: row.fact_id,
+      id: row.id,
+      type: row.type,
+      name: openText(db, "entities", "canonical_name", row.id, row.name, row.name_enc, true) ?? "",
+      aliases_json: openText(db, "entities", "aliases", row.id, row.aliases_json, row.aliases_enc, false) ?? "[]",
+    };
     const list = links.get(row.fact_id) ?? [];
-    list.push(row);
+    list.push(revealed);
     links.set(row.fact_id, list);
+  }
+  if (isSealed(db)) {
+    for (const list of links.values()) {
+      list.sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
+    }
   }
   return links;
 }

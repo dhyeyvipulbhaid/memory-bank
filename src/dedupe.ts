@@ -1,4 +1,5 @@
 import type { Database } from "bun:sqlite";
+import { openBytes, openText, sealBytes } from "./sealed.ts";
 
 /**
  * Exact text match for one bank: trim, collapse whitespace, ignore case.
@@ -12,10 +13,11 @@ interface FactRow {
   id: string;
   bank_id: string;
   text: string;
+  text_enc: unknown;
   occurrence_time: string | null;
   mentioned_at: string;
   created_at: string;
-  embedding: Uint8Array | null;
+  embedding: unknown;
   embedding_model: string | null;
   embedding_dim: number | null;
 }
@@ -24,7 +26,7 @@ interface FactRow {
 export function dedupeIdenticalFacts(db: Database): void {
   const rows = db
     .query(
-      `SELECT id, bank_id, text, occurrence_time, mentioned_at, created_at,
+      `SELECT id, bank_id, text, text_enc, occurrence_time, mentioned_at, created_at,
               embedding, embedding_model, embedding_dim
        FROM facts`,
     )
@@ -32,7 +34,8 @@ export function dedupeIdenticalFacts(db: Database): void {
 
   const groups = new Map<string, Map<string, FactRow[]>>();
   for (const row of rows) {
-    const normalized = normalizeFactText(row.text);
+    const text = openText(db, "facts", "text", row.id, row.text, row.text_enc, true) ?? "";
+    const normalized = normalizeFactText(text);
     if (!normalized) continue;
     let byText = groups.get(row.bank_id);
     if (!byText) {
@@ -71,11 +74,13 @@ export function dedupeIdenticalFacts(db: Database): void {
       if (keeper.embedding == null) {
         const donor = extras.find((row) => row.embedding != null && row.embedding_dim != null);
         if (donor?.embedding) {
+          const plain = openBytes(db, "facts", "embedding", donor.id, donor.embedding);
+          const sealed = sealBytes(db, "facts", "embedding", keeper.id, plain);
           db.query(
             `UPDATE facts
              SET embedding = ?, embedding_model = ?, embedding_dim = ?
              WHERE id = ? AND bank_id = ? AND embedding IS NULL`,
-          ).run(donor.embedding, donor.embedding_model, donor.embedding_dim, keeper.id, keeper.bank_id);
+          ).run(sealed, donor.embedding_model, donor.embedding_dim, keeper.id, keeper.bank_id);
         }
       }
       for (const extra of extras) {

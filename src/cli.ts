@@ -1,6 +1,8 @@
 #!/usr/bin/env bun
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { parseEncryptionKey } from "./crypto.ts";
+import { encryptBank } from "./encrypt-bank.ts";
 import {
   createOllamaEmbedder,
   createOllamaExtractor,
@@ -26,6 +28,7 @@ Usage:
   memory-bank forget --db <file> --id <fact-id> [--bank <id>]
   memory-bank graph --db <file> --out <graph.json> [--limit <n>] [--min-similarity <n>] [--since <iso>] [--until <iso>] [--no-observations] [--bank <id>]
   memory-bank graph-serve --db <file> [--port <n>] [--limit <n>] [--min-similarity <n>] [--no-observations] [--bank <id>]
+  memory-bank encrypt --db <file> --key-env <VAR> [--dry-run]
 
 retain calls a local Ollama server (default chat model qwen3:8b).
 remember and retain also embed with nomic-embed-text unless --no-embed is set.
@@ -36,7 +39,9 @@ backfill embeds facts that have no vector yet.
 sweep lists stored junk. It deletes only with --apply. Back up the sqlite file first.
 list and forget page and remove facts.
 graph writes a snapshot for the dev viewer. graph-serve opens it in a browser at 127.0.0.1.
-The SQLite file is plain local data.
+encrypt converts a plaintext file to AES-256-GCM field encryption. Back up the file first.
+Every command accepts --key-env <VAR>. The variable holds a 32-byte key as base64.
+Without a key, the file stays plaintext.
 `;
 
 export async function main(argv: string[]): Promise<number> {
@@ -58,19 +63,26 @@ export async function main(argv: string[]): Promise<number> {
       command !== "list" &&
       command !== "forget" &&
       command !== "graph" &&
-      command !== "graph-serve"
+      command !== "graph-serve" &&
+      command !== "encrypt"
     ) {
       console.error(`Unknown command: ${command}\n\n${USAGE}`);
       return 1;
     }
 
     const db = required(flags, "db");
+    if (command === "encrypt") {
+      const result = encryptBank(db, requireKey(flags), { dryRun: flags.has("dry-run") });
+      console.log(JSON.stringify(result, null, 2));
+      return 0;
+    }
     const embed =
       command === "backfill" ||
       ((command === "hybrid" || command === "reflect") && !flags.has("no-embed")) ||
       ((command === "retain" || command === "remember") && !flags.has("no-embed"));
     bank = openBank(db, {
       bankId: flags.get("bank"),
+      encryptionKey: optionalKey(flags),
       extractor:
         command === "retain"
           ? createOllamaExtractor({
@@ -191,7 +203,13 @@ function parseArgs(argv: string[]): { command: string; flags: Map<string, string
       continue;
     }
     const key = token.slice(2);
-    if (key === "no-embed" || key === "llm-rerank" || key === "apply" || key === "no-observations") {
+    if (
+      key === "no-embed" ||
+      key === "llm-rerank" ||
+      key === "apply" ||
+      key === "no-observations" ||
+      key === "dry-run"
+    ) {
       flags.set(key, "true");
       continue;
     }
@@ -201,6 +219,18 @@ function parseArgs(argv: string[]): { command: string; flags: Map<string, string
     index += 1;
   }
   return { command: command ?? "", flags };
+}
+
+function optionalKey(flags: Map<string, string>): Uint8Array | undefined {
+  if (!flags.has("key-env")) return undefined;
+  return requireKey(flags);
+}
+
+function requireKey(flags: Map<string, string>): Uint8Array {
+  const name = required(flags, "key-env");
+  const value = process.env[name];
+  if (value == null || value.trim() === "") throw new Error(`Environment variable ${name} is empty.`);
+  return parseEncryptionKey(value);
 }
 
 function required(flags: Map<string, string>, name: string): string {

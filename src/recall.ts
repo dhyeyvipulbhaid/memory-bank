@@ -2,6 +2,7 @@ import type { Database } from "bun:sqlite";
 import { MemoryBankError } from "./errors.ts";
 import { normalizeName } from "./names.ts";
 import { assertEntityType } from "./resolve.ts";
+import { isSealed, openText } from "./sealed.ts";
 import { estimateTokens, meaningfulTokens, tokenize } from "./tokens.ts";
 import type { FactKind, RecalledFact, RecallResult } from "./types.ts";
 
@@ -103,8 +104,16 @@ function scoreEntities(
   queryTokens: Set<string>,
 ): Map<string, number> {
   const rows = db
-    .query("SELECT id, canonical_name, aliases_json, type FROM entities WHERE bank_id = ?")
-    .all(bankId) as EntityHit[];
+    .query(
+      `SELECT id, canonical_name, canonical_name_enc, aliases_json, aliases_enc, type
+       FROM entities WHERE bank_id = ?`,
+    )
+    .all(bankId) as Array<EntityHit & { canonical_name_enc: unknown; aliases_enc: unknown }>;
+  for (const row of rows) {
+    row.canonical_name =
+      openText(db, "entities", "canonical_name", row.id, row.canonical_name, row.canonical_name_enc, true) ?? "";
+    row.aliases_json = openText(db, "entities", "aliases", row.id, row.aliases_json, row.aliases_enc, false) ?? "[]";
+  }
   const scores = new Map<string, number>();
   const paddedQuery = ` ${queryNorm} `;
   for (const row of rows) {
@@ -145,6 +154,16 @@ function candidateFactIds(
       ids.add(row.id);
     }
   }
+  if (isSealed(db)) {
+    const rows = db
+      .query("SELECT id, text, text_enc FROM facts WHERE bank_id = ?")
+      .all(bankId) as Array<{ id: string; text: string; text_enc: unknown }>;
+    for (const row of rows) {
+      const text = (openText(db, "facts", "text", row.id, row.text, row.text_enc, true) ?? "").toLowerCase();
+      if (tokens.some((token) => text.includes(token))) ids.add(row.id);
+    }
+    return [...ids];
+  }
   const like = db.query(
     "SELECT id FROM facts WHERE bank_id = ? AND lower(text) LIKE ? ESCAPE '\\'",
   );
@@ -158,30 +177,44 @@ function candidateFactIds(
 function loadFacts(db: Database, bankId: string, factIds: string[]): FactRow[] {
   return selectIds<FactRow>(
     db,
-    `SELECT id, text, kind, occurrence_time, mentioned_at, source_id
+    `SELECT id, text, text_enc, kind, occurrence_time, mentioned_at, source_id
      FROM facts WHERE bank_id = ? AND id IN (`,
     ")",
     bankId,
     factIds,
-  );
+  ).map((row) => {
+    const stored = row as FactRow & { text_enc: unknown };
+    return {
+      ...stored,
+      text: openText(db, "facts", "text", stored.id, stored.text, stored.text_enc, true) ?? "",
+    };
+  });
 }
 
 function loadLinks(db: Database, bankId: string, factIds: string[]): Map<string, RecalledFact["entities"]> {
   const rows = selectIds<LinkRow>(
     db,
-    `SELECT g.fact_id AS fact_id, e.id AS id, e.canonical_name AS name, e.type AS type
+    `SELECT g.fact_id AS fact_id, e.id AS id, e.canonical_name AS name,
+            e.canonical_name_enc AS name_enc, e.type AS type
      FROM edges g
      JOIN entities e ON e.id = g.entity_id AND e.bank_id = g.bank_id
      WHERE g.bank_id = ? AND g.edge_type = 'mentions' AND g.fact_id IN (`,
-    ") ORDER BY e.canonical_name",
+    ") ORDER BY e.canonical_name, e.id",
     bankId,
     factIds,
   );
   const links = new Map<string, RecalledFact["entities"]>();
   for (const row of rows) {
-    const list = links.get(row.fact_id) ?? [];
-    list.push({ id: row.id, name: row.name, type: assertEntityType(row.type) });
-    links.set(row.fact_id, list);
+    const stored = row as LinkRow & { name_enc: unknown };
+    const name = openText(db, "entities", "canonical_name", stored.id, stored.name, stored.name_enc, true) ?? "";
+    const list = links.get(stored.fact_id) ?? [];
+    list.push({ id: stored.id, name, type: assertEntityType(stored.type) });
+    links.set(stored.fact_id, list);
+  }
+  if (isSealed(db)) {
+    for (const list of links.values()) {
+      list.sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : left.id < right.id ? -1 : 1));
+    }
   }
   return links;
 }

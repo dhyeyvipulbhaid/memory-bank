@@ -338,7 +338,7 @@ test("opening a version 1 database adds embedding columns and keeps rows", () =>
     path,
     "SELECT value FROM schema_meta WHERE key = 'version'",
   );
-  expect(version).toEqual([{ value: "3" }]);
+  expect(version).toEqual([{ value: "4" }]);
   bank.close();
 });
 

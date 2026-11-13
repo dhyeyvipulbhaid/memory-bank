@@ -85,6 +85,12 @@ export interface OpenBankOptions {
   reranker?: Reranker | null;
   /** Used by reflect. Defaults to a local Ollama chat model. */
   reflector?: Reflector | null;
+  /**
+   * 32-byte AES-256 key, raw bytes or base64. Omit it and the file stays plaintext.
+   * A key on a new empty file turns encryption on. A key on an existing plaintext
+   * file is refused; call encryptBank first.
+   */
+  encryptionKey?: Uint8Array | string;
 }
 
 export interface RetainInput {
