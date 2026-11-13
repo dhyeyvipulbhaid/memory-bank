@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>memory-bank graph</title>
+    <style>
+      html, body { margin: 0; height: 100%; background: #0f1419; color: #e7ecf3; font: 14px/1.4 ui-sans-serif, system-ui, sans-serif; }
+      #graph { width: 100%; height: 100%; }
+      #legend {
+        position: fixed; top: 12px; left: 12px; z-index: 2;
+        background: rgba(15, 20, 25, 0.88); border: 1px solid #2a3441; border-radius: 10px;
+        padding: 12px 14px; max-width: 260px;
+      }
+      h1 { font-size: 14px; margin: 0 0 8px; }
+      .row { display: flex; align-items: center; gap: 8px; margin: 4px 0; }
+      .swatch { width: 14px; height: 14px; border-radius: 3px; }
+      .bar { height: 10px; border-radius: 999px; background: linear-gradient(90deg, #64748b, #d97706); margin: 6px 0; }
+      #hover {
+        position: fixed; right: 12px; bottom: 12px; z-index: 2; max-width: 360px;
+        background: rgba(15, 20, 25, 0.92); border: 1px solid #2a3441; border-radius: 10px;
+        padding: 10px 12px; display: none;
+      }
+    </style>
+  </head>
+  <body>
+    <aside id="legend">
+      <h1>memory-bank</h1>
+      <div class="bar"></div>
+      <div class="row"><span>older</span><span style="margin-left:auto">newer</span></div>
+      <div class="row"><span class="swatch" style="background:#3b82f6"></span> semantic</div>
+      <div class="row"><span class="swatch" style="background:#94a3b8"></span> temporal</div>
+      <div class="row"><span class="swatch" style="background:#16a34a"></span> entity</div>
+      <div class="row"><span class="swatch" style="background:#9333ea"></span> derived</div>
+    </aside>
+    <div id="hover"></div>
+    <div id="graph"></div>
+    <script src="https://unpkg.com/force-graph@1.43.5/dist/force-graph.min.js"></script>
+    <script>
+      const edgeColor = {
+        semantic: "#3b82f6",
+        temporal: "#94a3b8",
+        entity: "#16a34a",
+        derived: "#9333ea",
+      };
+      function recencyColor(value) {
+        const amount = Math.max(0, Math.min(1, Number(value) || 0));
+        const from = [100, 116, 139];
+        const to = [217, 119, 6];
+        const mix = from.map((channel, index) => Math.round(channel + (to[index] - channel) * amount));
+        return "rgb(" + mix.join(",") + ")";
+      }
+      const hover = document.getElementById("hover");
+      fetch("./graph.json")
+        .then((response) => response.json())
+        .then((snapshot) => {
+          const links = (snapshot.edges || []).map((edge) => ({
+            source: edge.source,
+            target: edge.target,
+            type: edge.type,
+            weight: edge.weight,
+          }));
+          ForceGraph()(document.getElementById("graph"))
+            .backgroundColor("#0f1419")
+            .graphData({ nodes: snapshot.nodes || [], links })
+            .nodeLabel((node) => node.label)
+            .nodeColor((node) => recencyColor(node.recency))
+            .nodeRelSize(4)
+            .nodeVal((node) => 1 + Math.min(6, node.sourceFactCount || 1))
+            .linkColor((link) => edgeColor[link.type] || "#64748b")
+            .linkWidth((link) => 0.6 + Math.min(3, link.weight || 1))
+            .linkDirectionalArrowLength((link) => (link.type === "derived" ? 4 : 0))
+            .onNodeHover((node) => {
+              if (!node) {
+                hover.style.display = "none";
+                return;
+              }
+              hover.style.display = "block";
+              hover.textContent = node.kind + " · " + (node.mentionedAt || "") + "\n" + node.label;
+            });
+        })
+        .catch((error) => {
+          hover.style.display = "block";
+          hover.textContent = "Could not load graph.json. " + error;
+        });
+    </script>
+  </body>
+</html>

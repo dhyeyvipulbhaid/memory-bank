@@ -5,6 +5,7 @@ import { normalizeFactText } from "./dedupe.ts";
 import { createBruteForceCosineRanker, decodeEmbedding, prepareEmbedding } from "./embed.ts";
 import { EmbedderUnavailableError, MemoryBankError, ReflectFailedError, ReflectorUnavailableError } from "./errors.ts";
 import { normalizeExtractedFacts } from "./extract/validate.ts";
+import { buildGraphSnapshot } from "./graph.ts";
 import {
   DEFAULT_HALF_LIFE_DAYS,
   DEFAULT_HYBRID_WEIGHTS,
@@ -40,6 +41,8 @@ import {
   type SweepJunkResult,
   type UpdateFactResult,
   type ForgetManyResult,
+  type GraphSnapshot,
+  type GraphSnapshotInput,
   type OpenBankOptions,
   type RecallInput,
   type RecallResult,
@@ -353,6 +356,14 @@ export class MemoryBank {
       removedObservationIds: removed.removedObservationIds,
       removedEntityIds: removed.removedEntityIds,
     };
+  }
+
+  graphSnapshot(input: GraphSnapshotInput = {}): GraphSnapshot {
+    this.assertOpen();
+    if (input.bankId != null && input.bankId !== this.bankId) {
+      throw new MemoryBankError("bankId does not match this bank.");
+    }
+    return buildGraphSnapshot(this.db, this.bankId, input);
   }
 
   listFacts(input: ListFactsInput): ListFactsResult {
