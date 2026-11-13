@@ -214,6 +214,26 @@ bun test test/reflect.test.ts
 MEMORY_BANK_OLLAMA_TEST=1 bun test test/ollama-reflect.integration.test.ts
 ```
 
+### Cleanup
+
+Facts saved before the junk filter, including assistant disclaimers, session narration, `unknown`, and near-empty text, can still be in the file. `sweepJunk` uses the same `junkReason` check as `retain`. It lists matches and does not delete unless `dryRun` is false.
+
+Copy the sqlite file before applying a sweep.
+
+```bash
+cp ./memory.sqlite ./memory.sqlite.bak
+bun src/cli.ts sweep --db ./memory.sqlite
+bun src/cli.ts sweep --db ./memory.sqlite --apply
+```
+
+`listFacts({ limit, offset, kind?, entity?, query? })` pages the stored facts. `updateFact(id, text)` rewrites one fact, embeds the new text, and folds it into an existing row when the normalized text already exists. `forget(id)` and `forgetMany(ids)` delete facts, mention links, entities left with no links, and observations that cited only the deleted facts.
+
+```bash
+bun src/cli.ts list --db ./memory.sqlite --limit 20 --entity Maya
+bun src/cli.ts forget --db ./memory.sqlite --id <fact-id>
+bun test test/sweep.test.ts
+```
+
 ### Extractors
 
 ```ts

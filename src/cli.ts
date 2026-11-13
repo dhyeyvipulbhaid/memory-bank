@@ -19,13 +19,18 @@ Usage:
   memory-bank hybrid --db <file> --query <text> --token-budget <n> [--bank <id>] [--embed-model <name>] [--host <url>] [--half-life-days <n>] [--llm-rerank] [--no-embed]
   memory-bank reflect --db <file> [--query <text>] [--entity <name>] [--topic <text>] [--since <iso>] [--until <iso>] [--max <n>] [--bank <id>] [--model <name>] [--host <url>] [--timeout-ms <n>] [--no-embed]
   memory-bank backfill --db <file> [--bank <id>] [--embed-model <name>] [--host <url>] [--timeout-ms <n>]
+  memory-bank sweep --db <file> [--bank <id>] [--apply]
+  memory-bank list --db <file> --limit <n> [--offset <n>] [--kind world|experience] [--entity <name>] [--query <text>] [--bank <id>]
+  memory-bank forget --db <file> --id <fact-id> [--bank <id>]
 
 retain calls a local Ollama server (default chat model qwen3:8b).
 remember and retain also embed with nomic-embed-text unless --no-embed is set.
 If embedding fails, the fact is still stored. recall does not use a model.
 hybrid fuses keyword, vector, and graph signals. It still answers if embedding is down.
 reflect asks Ollama (default qwen3:8b) for observations and writes nothing if that call fails.
-backfill embeds facts that have no vector yet. The SQLite file is plain local data.
+backfill embeds facts that have no vector yet.
+sweep lists stored junk. It deletes only with --apply. Back up the sqlite file first.
+list and forget page and remove facts. The SQLite file is plain local data.
 `;
 
 export async function main(argv: string[]): Promise<number> {
@@ -42,7 +47,10 @@ export async function main(argv: string[]): Promise<number> {
       command !== "recall" &&
       command !== "backfill" &&
       command !== "hybrid" &&
-      command !== "reflect"
+      command !== "reflect" &&
+      command !== "sweep" &&
+      command !== "list" &&
+      command !== "forget"
     ) {
       console.error(`Unknown command: ${command}\n\n${USAGE}`);
       return 1;
@@ -128,6 +136,21 @@ export async function main(argv: string[]): Promise<number> {
         maxObservations: flags.has("max") ? requireNumber(flags, "max") : undefined,
       });
       console.log(JSON.stringify(result, null, 2));
+    } else if (command === "sweep") {
+      const result = bank.sweepJunk({ dryRun: !flags.has("apply") });
+      console.log(JSON.stringify(result, null, 2));
+    } else if (command === "list") {
+      const result = bank.listFacts({
+        kind: parseKind(flags.get("kind")),
+        entity: flags.get("entity"),
+        query: flags.get("query"),
+        limit: requireNumber(flags, "limit"),
+        offset: flags.has("offset") ? requireNumber(flags, "offset") : undefined,
+      });
+      console.log(JSON.stringify(result, null, 2));
+    } else if (command === "forget") {
+      const result = bank.forget(required(flags, "id"));
+      console.log(JSON.stringify(result, null, 2));
     } else {
       const result = await bank.backfillEmbeddings();
       console.log(JSON.stringify(result, null, 2));
@@ -154,7 +177,7 @@ function parseArgs(argv: string[]): { command: string; flags: Map<string, string
       continue;
     }
     const key = token.slice(2);
-    if (key === "no-embed" || key === "llm-rerank") {
+    if (key === "no-embed" || key === "llm-rerank" || key === "apply") {
       flags.set(key, "true");
       continue;
     }

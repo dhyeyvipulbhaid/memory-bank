@@ -241,6 +241,51 @@ export interface ReflectResult {
   removedIds: string[];
 }
 
+export interface SweepJunkInput {
+  /** Defaults to true. Deletion happens only when this is false. */
+  dryRun?: boolean;
+}
+
+export interface SweepCandidate {
+  id: string;
+  text: string;
+  reason: string;
+}
+
+export interface SweepJunkResult {
+  dryRun: boolean;
+  candidates: SweepCandidate[];
+  deleted: number;
+  removedObservationIds: string[];
+  removedEntityIds: string[];
+}
+
+export interface ListFactsInput {
+  kind?: FactKind;
+  /** Canonical name or alias. */
+  entity?: string;
+  query?: string;
+  limit: number;
+  offset?: number;
+}
+
+export interface ListFactsResult {
+  facts: FactRecord[];
+  total: number;
+}
+
+export interface UpdateFactResult {
+  fact: FactRecord;
+  /** True when the new text matched another fact and this row was folded into it. */
+  mergedIntoExisting: boolean;
+}
+
+export interface ForgetManyResult {
+  removedFactIds: string[];
+  removedObservationIds: string[];
+  removedEntityIds: string[];
+}
+
 export interface HybridRecallResult {
   facts: HybridFact[];
   /** Sum of estimateTokens(fact.text) for the facts returned. */
