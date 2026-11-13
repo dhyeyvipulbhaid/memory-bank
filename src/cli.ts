@@ -2,6 +2,7 @@
 import {
   createOllamaEmbedder,
   createOllamaExtractor,
+  createOllamaReranker,
   openBank,
   type EntityType,
   type MemoryBank,
@@ -14,11 +15,13 @@ Usage:
   memory-bank retain --db <file> --content <text> [--context <text>] [--speaker <name>] [--mentioned-at <iso>] [--bank <id>] [--model <name>] [--embed-model <name>] [--host <url>] [--timeout-ms <n>] [--no-embed]
   memory-bank remember --db <file> --text <text> [--kind world|experience] [--entities Name:type,...] [--occurrence-time <iso>] [--mentioned-at <iso>] [--bank <id>] [--embed-model <name>] [--host <url>] [--timeout-ms <n>] [--no-embed]
   memory-bank recall --db <file> --query <text> --token-budget <n> [--bank <id>]
+  memory-bank hybrid --db <file> --query <text> --token-budget <n> [--bank <id>] [--embed-model <name>] [--host <url>] [--half-life-days <n>] [--llm-rerank] [--no-embed]
   memory-bank backfill --db <file> [--bank <id>] [--embed-model <name>] [--host <url>] [--timeout-ms <n>]
 
 retain calls a local Ollama server (default chat model qwen3:8b).
 remember and retain also embed with nomic-embed-text unless --no-embed is set.
 If embedding fails, the fact is still stored. recall does not use a model.
+hybrid fuses keyword, vector, and graph signals. It still answers if embedding is down.
 backfill embeds facts that have no vector yet. The SQLite file is plain local data.
 `;
 
@@ -30,14 +33,22 @@ export async function main(argv: string[]): Promise<number> {
       console.error(USAGE);
       return 1;
     }
-    if (command !== "retain" && command !== "remember" && command !== "recall" && command !== "backfill") {
+    if (
+      command !== "retain" &&
+      command !== "remember" &&
+      command !== "recall" &&
+      command !== "backfill" &&
+      command !== "hybrid"
+    ) {
       console.error(`Unknown command: ${command}\n\n${USAGE}`);
       return 1;
     }
 
     const db = required(flags, "db");
     const embed =
-      command === "backfill" || ((command === "retain" || command === "remember") && !flags.has("no-embed"));
+      command === "backfill" ||
+      (command === "hybrid" && !flags.has("no-embed")) ||
+      ((command === "retain" || command === "remember") && !flags.has("no-embed"));
     bank = openBank(db, {
       bankId: flags.get("bank"),
       extractor:
@@ -51,6 +62,13 @@ export async function main(argv: string[]): Promise<number> {
       embedder: embed
         ? createOllamaEmbedder({
             model: flags.get("embed-model"),
+            host: flags.get("host"),
+            timeoutMs: flags.has("timeout-ms") ? requireNumber(flags, "timeout-ms") : undefined,
+          })
+        : undefined,
+      reranker: flags.has("llm-rerank")
+        ? createOllamaReranker({
+            model: flags.get("model"),
             host: flags.get("host"),
             timeoutMs: flags.has("timeout-ms") ? requireNumber(flags, "timeout-ms") : undefined,
           })
@@ -80,6 +98,14 @@ export async function main(argv: string[]): Promise<number> {
         tokenBudget: requireNumber(flags, "token-budget"),
       });
       console.log(JSON.stringify(result, null, 2));
+    } else if (command === "hybrid") {
+      const result = await bank.hybridRecall({
+        query: required(flags, "query"),
+        tokenBudget: requireNumber(flags, "token-budget"),
+        halfLifeDays: flags.has("half-life-days") ? requireNumber(flags, "half-life-days") : undefined,
+        llmRerank: flags.has("llm-rerank"),
+      });
+      console.log(JSON.stringify(result, null, 2));
     } else {
       const result = await bank.backfillEmbeddings();
       console.log(JSON.stringify(result, null, 2));
@@ -106,7 +132,7 @@ function parseArgs(argv: string[]): { command: string; flags: Map<string, string
       continue;
     }
     const key = token.slice(2);
-    if (key === "no-embed") {
+    if (key === "no-embed" || key === "llm-rerank") {
       flags.set(key, "true");
       continue;
     }
