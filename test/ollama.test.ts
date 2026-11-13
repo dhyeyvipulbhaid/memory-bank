@@ -160,6 +160,8 @@ test("the extract prompt asks for occurrenceTime only on a real occurrence", asy
   expect(system).toContain("undated");
   expect(system).toContain('Never use "now"');
   expect(system).toContain("current clock");
+  expect(system).toContain("lack of knowledge");
+  expect(system).toContain("Maya does not have a preference for morning meetings");
   expect(system).not.toContain("unless the event is that moment");
   expect(user).toContain("not when an event happened");
   expect(user).toContain("mentioned_at: 2026-11-12T22:15:00.000Z");

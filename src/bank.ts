@@ -4,10 +4,12 @@ import { openDatabase } from "./db.ts";
 import { normalizeFactText } from "./dedupe.ts";
 import { MemoryBankError } from "./errors.ts";
 import { normalizeExtractedFacts } from "./extract/validate.ts";
+import { isAssistantKnowledgeGap } from "./knowledge-gap.ts";
 import { recallFacts } from "./recall.ts";
 import { assertEntityType, resolveMentions, type Mention } from "./resolve.ts";
 import {
   FACT_KINDS,
+  type ExtractedFact,
   type Extractor,
   type FactKind,
   type FactRecord,
@@ -50,7 +52,7 @@ export class MemoryBank {
       if (error instanceof MemoryBankError) throw error;
       throw new MemoryBankError("Extraction failed; nothing was written.", { cause: error });
     }
-    const facts = normalizeExtractedFacts(extracted);
+    const facts = factsToRetain(normalizeExtractedFacts(extracted));
     const write = this.db.transaction((): RetainResult => {
       const sourceId = insertSource(this.db, this.bankId, {
         text: content,
@@ -135,6 +137,13 @@ export function openBank(path: string, options: OpenBankOptions = {}): MemoryBan
   const bankId = (options.bankId ?? "default").trim();
   if (!bankId) throw new MemoryBankError("bankId cannot be empty.");
   return new MemoryBank(openDatabase(path), path, bankId, options.extractor);
+}
+
+const MAX_RETAINED_FACTS = 5;
+
+/** Automatic retain only. remember() saves the caller's text as given. */
+function factsToRetain(facts: ExtractedFact[]): ExtractedFact[] {
+  return facts.filter((fact) => !isAssistantKnowledgeGap(fact.text)).slice(0, MAX_RETAINED_FACTS);
 }
 
 function requiredText(value: string, label: string): string {

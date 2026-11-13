@@ -1,15 +1,14 @@
 import { ExtractionFailedError } from "../errors.ts";
 import { ENTITY_TYPES, type EntityType, type ExtractedFact, type FactKind } from "../types.ts";
 
-const MAX_FACTS = 5;
 const MAX_FACT_CHARS = 2000;
 
+/** Validates extractor output. retain() decides which of these are stored. */
 export function normalizeExtractedFacts(value: unknown): ExtractedFact[] {
   if (!Array.isArray(value)) {
     throw new ExtractionFailedError("Extractor must return a list of facts. Nothing was written.");
   }
-  const facts = value.map((item) => normalizeFact(item));
-  return facts.slice(0, MAX_FACTS);
+  return value.map((item) => normalizeFact(item));
 }
 
 function normalizeFact(item: unknown): ExtractedFact {
