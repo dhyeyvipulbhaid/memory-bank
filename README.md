@@ -1,16 +1,55 @@
 # memory-bank
 
-Local knowledge-graph memory for an AI agent.
+Local knowledge-graph memory for an AI agent. Facts live in one SQLite file. A later call returns only the slice that fits a token budget.
 
-After a chat, a local model pulls a few narrative facts out of the text and stores them in SQLite. A later run asks for what is relevant and gets back only the facts that fit a token budget. The file on disk can get large. The model context sees a slice of it.
+`retain` sends a transcript to a local Ollama chat model and keeps up to five facts. If that call fails, or the reply is not usable JSON, it throws and writes nothing. `remember` stores one fact by hand and does not call a model. `recall` matches entity names and keywords and never uses the network. Pass an embedder and new facts also get a vector. If that call fails, the fact is still saved and the vector stays null.
 
-You can also save a fact by hand. That goes into the same graph and does not call a model.
+The package is a library and a command-line tool, plus a local graph viewer for development. Memory stays on the machine. Encryption is opt-in: with no key the file is plaintext, and with a 32-byte key the sensitive fields are AES-256-GCM.
 
-This is a library and a small command-line tool. A host app can import it later. There is no UI in this package.
+## What it does
 
-Memory stays on the machine. In v1 the SQLite file is **not encrypted**. Anyone who can read the file can read the memory.
+- **Encryption at rest.** `openBank({ encryptionKey })` accepts a 32-byte key (`Uint8Array` or base64). Fact text, observation text, embeddings, entity names and aliases, and source text are encrypted with AES-256-GCM. Each value gets a fresh 12-byte IV, and the associated data is the table, column, and row id. Name resolution and exact dedup compare an HMAC-SHA256 blind index from a separate HKDF subkey. `encryptBank(path, key)` and `memory-bank encrypt --db <file> --key-env MEMORY_BANK_KEY` convert an existing plaintext file in one transaction. `--dry-run` only counts fields. See [Encryption at rest](#encryption-at-rest).
+- **Semantic search.** `createOllamaEmbedder()` stores `nomic-embed-text` vectors (little-endian float32, plus model name and dimension). `semanticSearch` ranks facts by brute-force cosine. `backfillEmbeddings` fills facts that have no vector yet and skips rows that already have one.
+- **Hybrid recall.** `hybridRecall` fuses keyword overlap, vector similarity, and the entity graph (alias match plus one hop) with reciprocal rank fusion, then multiplies by recency. A time cue in the query (`yesterday`, `last week`, `in March`, an explicit date) keeps facts inside that UTC window. `llmRerank: true` asks the chat model (`qwen3:8b` by default) to reorder the list. It is off by default, and a failed rerank leaves the fused order. A missing embedder drops the vector list and the other two still run. Personal-Agents should call `hybridRecall` for the prompt slice. `recall` stays the keyword and entity lookup.
+- **Reflect.** `reflect` asks the chat model for a few observations that cite the facts they came from. They are stored apart from world and experience facts. `hybridRecall` returns them with `derived: true` unless `includeObservations` is false. Running the same scope again updates a matching observation and drops the ones the model no longer returns.
+- **Junk sweep.** `sweepJunk` uses the same `junkReason` check as `retain` on facts already in the file (assistant disclaimers, session narration, `unknown`, near-empty text). The default is a dry run. Deletion happens only when `dryRun` is false, which is `memory-bank sweep --apply`. Back up the file first.
+- **Memory graph.** `graphSnapshot` returns `{ nodes, edges }` for one bank: semantic neighbors, facts within a week of each other, shared mentions, and observation-to-fact links. The default slice is 200 nodes and the hard cap is 1000. `memory-bank graph-serve` opens a local force-directed viewer at `http://127.0.0.1:4173`. That viewer is a dev tool.
 
-`retain` calls Ollama to extract facts. If that call fails, or the reply is not usable JSON, `retain` throws and does not write a partial result. `remember` and `recall` do not extract, and they work with Ollama stopped. When you pass an embedder, `retain` and `remember` also ask Ollama for a vector. If that call fails, the fact is still saved and the vector stays null. `recall` never calls the network.
+## Using it from another repo
+
+Pin a commit. This package is not published to npm.
+
+```json
+{
+  "dependencies": {
+    "memory-bank": "github:dhyeyvipulbhaid/memory-bank#356954d9c8b49cec7f3e413ca4fb70d1db1894e9"
+  }
+}
+```
+
+Replace that sha with the commit you want. The host app needs [Bun](https://bun.sh) 1.1 or newer. `retain` and `reflect` need a local Ollama server and a chat model (`ollama pull qwen3:8b`). Semantic search, hybrid recall, and reflect embeddings also need `ollama pull nomic-embed-text`. `remember` and `recall` work with Ollama stopped.
+
+```ts
+import { createOllamaEmbedder, createOllamaExtractor, openBank } from "memory-bank";
+
+const bank = openBank("./memory.sqlite", {
+  extractor: createOllamaExtractor({ model: "qwen3:8b" }),
+  embedder: createOllamaEmbedder({ model: "nomic-embed-text" }),
+});
+
+await bank.retain({
+  content: "Yesterday Maya said the launch moved to June.",
+  speaker: "user",
+});
+
+const memory = await bank.recall({
+  query: "Maya launch",
+  tokenBudget: 800,
+});
+// memory.facts is the keyword slice. Use hybridRecall for the prompt.
+
+bank.close();
+```
 
 ## Requirements
 
