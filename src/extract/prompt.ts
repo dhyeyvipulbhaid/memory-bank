@@ -24,6 +24,7 @@ How to write facts:
 - Never use "now" or the current clock as occurrenceTime. Never copy mentioned_at into occurrenceTime.
 - entities lists the people, organizations, places, products, and concepts named in that fact. type is one of: person, org, place, product, concept, other.
 - Use the most specific name written in the snippet. Do not invent surnames. If two names in this snippet are the same person, use one spelling.
+- Skip a fact that only reports your own lack of knowledge, or the assistant's or the model's. Do not emit "I don't know who Pepper is", "I do not have any information about that", or "I'm not sure who that is". Keep a real negative about someone else, such as "Maya does not have a preference for morning meetings".
 - Do not add facts the snippet does not support.
 - If nothing is worth keeping, return {"facts":[]}.`;
 

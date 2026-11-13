@@ -83,6 +83,8 @@ Sends the text to the extractor, then stores the original text as a source docum
 
 Each fact is `world` (about other people or things) or `experience` (the agent's own action, written in first person by the extractor). `mentionedAt` is when the text was said. It defaults to now. `occurrenceTime` is when the event actually happened, and only when the source text names that occurrence. Preferences, standing facts, and undated statements leave it null. A missing occurrence is never filled with the current clock or with `mentionedAt`.
 
+A fact that only says the assistant, the model, or "I" lacks knowledge is dropped before it is saved. "The assistant does not have specific information about a person named Pepper" is not stored. A negative fact about someone else still is, including "Maya does not have a preference for morning meetings". Rows already in the file are left as they are. `remember` does not use this filter.
+
 Returns `{ sourceId, facts }`.
 
 If this bank already has a fact with the same text, after trimming, collapsing whitespace, and ignoring case, that row is reused. The id, wording, kind, mentioned time, and source id stay as they were. Entity mentions from the new write are still resolved and attached. A null `occurrenceTime` can be filled when the new write has one. A stored `occurrenceTime` is left unchanged, including when the new write has null. The later chat is still saved as its own source. The same text in another bank id is a different fact. A different sentence that only shares a word or an entity is also a different fact.

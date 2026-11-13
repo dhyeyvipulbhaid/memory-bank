@@ -14,6 +14,26 @@ function dbPath(): string {
   return created.path;
 }
 
+test("remember stores a knowledge disclaimer when the caller passes it", async () => {
+  const path = dbPath();
+  const text = "The assistant does not have specific information about a person named Pepper.";
+  const bank = openBank(path, {
+    extractor: createFakeExtractor(() => {
+      throw new Error("extractor should not run for remember");
+    }),
+  });
+
+  const fact = await bank.remember({
+    text,
+    entities: [{ name: "Pepper", type: "person" }],
+  });
+
+  expect(fact.text).toBe(text);
+  const rows = readRows<{ text: string }>(path, "SELECT text FROM facts");
+  expect(rows).toEqual([{ text }]);
+  bank.close();
+});
+
 test("remember stores a manual fact without calling an extractor", async () => {
   const path = dbPath();
   const bank = openBank(path, {
