@@ -16,16 +16,20 @@ export type FakeReflect = (input: ReflectRequest) => ObservationDraft[] | Promis
 
 const DEFAULT_MODEL = "qwen3:8b";
 const DEFAULT_HOST = "http://127.0.0.1:11434";
+/** First load of a local chat model often exceeds a short client timeout. */
+const DEFAULT_TIMEOUT_MS = 120_000;
 
-const REFLECT_SYSTEM = `You write a few durable observations from memory facts.
-Each observation is a pattern, preference, or short summary supported by the facts you cite.
+const REFLECT_SYSTEM = `You write durable observations about the topic from the facts listed.
 Reply with JSON only:
 {"observations":[{"text":"...","confidence":0.0,"sourceFactIds":["..."]}]}
-Rules:
-- Use only the given fact ids.
-- Cite at least one id on every observation.
-- confidence is from 0 to 1.
-- Write at most 5 observations.
+Quality:
+- One observation per distinct pattern. Do not restate one pattern in different words.
+- Cite at least two facts. A single fact is not an observation.
+- State the pattern directly. No hedging and no words such as suggesting, indicating, seems, might, or possibly.
+- Do not restate a single fact in new words.
+- Do not write meta comments such as "X is separate from Y" or "mentioned in the context of".
+- Use only facts about the topic. Ignore the rest.
+- confidence is from 0 to 1. At most 5 observations.
 - Do not say the assistant lacks knowledge or just did something in this chat.`;
 
 export function createFakeReflector(reflect: FakeReflect): Reflector {
@@ -36,7 +40,7 @@ export function createOllamaReflector(options: OllamaReflectorOptions = {}): Ref
   const model = options.model?.trim() || DEFAULT_MODEL;
   const host = (options.host ?? DEFAULT_HOST).replace(/\/+$/, "");
   const fetchImpl = options.fetchImpl ?? fetch;
-  const timeoutMs = options.timeoutMs ?? 60_000;
+  const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
   return {
     async reflect(input) {

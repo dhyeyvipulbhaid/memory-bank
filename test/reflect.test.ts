@@ -170,6 +170,66 @@ test("reflect stores at most the requested number of observations", async () => 
   bank.close();
 });
 
+test("reflect keeps one relevant Maya observation and drops duplicates and off-topic filler", async () => {
+  const path = dbPath();
+  let gathered: string[] = [];
+  const bank = openBank(path, {
+    reflector: createFakeReflector((input) => {
+      gathered = input.facts.map((fact) => fact.id);
+      const maya = input.facts.filter((fact) => fact.text.includes("Maya")).map((fact) => fact.id);
+      const hike = input.facts.find((fact) => fact.text.includes("hiking"))?.id;
+      const dog = input.facts.find((fact) => fact.text.includes("dog"))?.id;
+      return [
+        {
+          text: "Maya met multiple times recently, with consistent interaction.",
+          confidence: 0.9,
+          sourceFactIds: maya,
+        },
+        {
+          text: "Maya's meetings were scheduled on different days, suggesting varied purposes.",
+          confidence: 0.7,
+          sourceFactIds: maya,
+        },
+        {
+          text: "Maya's meetings were scheduled on specific days, indicating a planned routine.",
+          confidence: 0.6,
+          sourceFactIds: maya,
+        },
+        {
+          text: "Personal activities are separate from his meetings with Maya.",
+          confidence: 0.55,
+          sourceFactIds: hike ? [hike] : ["not-gathered"],
+        },
+        {
+          text: "The hiking and the dog were mentioned in the context of personal time.",
+          confidence: 0.5,
+          sourceFactIds: dog ? [dog] : ["not-gathered"],
+        },
+      ];
+    }),
+  });
+  const monday = await bank.remember({
+    text: "Maya and I met Monday to plan the launch.",
+    entities: [{ name: "Maya", type: "person" }],
+  });
+  const thursday = await bank.remember({
+    text: "Maya and I met Thursday to review the budget.",
+    entities: [{ name: "Maya", type: "person" }],
+  });
+  const hike = await bank.remember({ text: "I went hiking in the hills on Saturday." });
+  const dog = await bank.remember({ text: "The dog slept through the afternoon." });
+
+  const result = await bank.reflect({ query: "Maya meetings" });
+  expect(gathered.sort()).toEqual([monday.id, thursday.id].sort());
+  expect(gathered).not.toContain(hike.id);
+  expect(gathered).not.toContain(dog.id);
+  expect(result.observations.map((item) => item.text)).toEqual([
+    "Maya met multiple times recently, with consistent interaction.",
+  ]);
+  expect(result.observations[0]?.sourceFactIds.sort()).toEqual([monday.id, thursday.id].sort());
+  bank.close();
+});
+
 test("a down reflector writes nothing", async () => {
   const path = dbPath();
   const bank = openBank(path, {

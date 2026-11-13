@@ -2,7 +2,7 @@ import type { Database } from "bun:sqlite";
 import { chunkText } from "./chunk.ts";
 import { openDatabase } from "./db.ts";
 import { normalizeFactText } from "./dedupe.ts";
-import { createBruteForceCosineRanker, prepareEmbedding } from "./embed.ts";
+import { createBruteForceCosineRanker, decodeEmbedding, prepareEmbedding } from "./embed.ts";
 import { EmbedderUnavailableError, MemoryBankError, ReflectFailedError, ReflectorUnavailableError } from "./errors.ts";
 import { normalizeExtractedFacts } from "./extract/validate.ts";
 import {
@@ -257,15 +257,24 @@ export class MemoryBank {
       if (error instanceof MemoryBankError) throw error;
       throw new ReflectorUnavailableError("Reflect failed. Nothing was written.", { cause: error });
     }
+    const numeric = new Map<string, number[]>();
+    const vectors = new Map<string, Awaited<ReturnType<MemoryBank["vectorFor"]>>>();
+    for (const draft of drafts) {
+      const key = normalizeFactText(draft.text);
+      if (!key || vectors.has(key)) continue;
+      const stored = await this.vectorFor(draft.text);
+      vectors.set(key, stored);
+      if (stored) numeric.set(key, Array.from(decodeEmbedding(stored.bytes, stored.dim) ?? []));
+    }
     const accepted = acceptObservations(
       drafts,
       new Set(gathered.map((fact) => fact.id)),
       maxObservations,
+      {
+        singleEntity: Boolean(input.entity?.trim()) && !input.query?.trim(),
+        vectors: numeric,
+      },
     );
-    const vectors = new Map<string, Awaited<ReturnType<MemoryBank["vectorFor"]>>>();
-    for (const draft of accepted) {
-      vectors.set(normalizeFactText(draft.text), await this.vectorFor(draft.text));
-    }
     const now = new Date().toISOString();
     return saveObservations(
       this.db,
@@ -324,8 +333,11 @@ export class MemoryBank {
         includeObservations: false,
         now: input.now,
       });
-      rows = recalled.facts
-        .filter((fact) => !fact.derived)
+      const ranked = recalled.facts.filter((fact) => !fact.derived && fact.score > 0);
+      const best = ranked.reduce((max, fact) => Math.max(max, fact.score), 0);
+      const cutoff = best * 0.5;
+      rows = ranked
+        .filter((fact) => fact.score >= cutoff)
         .map((fact) => ({
           id: fact.id,
           text: fact.text,

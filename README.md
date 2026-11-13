@@ -195,9 +195,9 @@ MEMORY_BANK_OLLAMA_TEST=1 bun test test/ollama-embed.integration.test.ts
 
 The scope is the query, entity, topic, and time bounds. Running `reflect` again on that same scope updates an observation whose text is unchanged and deletes observations the model no longer returns. `forget(factId)` removes that fact. An observation that cited only the forgotten fact is removed. One that still cites another fact stays.
 
-A draft that cites nothing, cites an id that was not gathered, or fails the same junk filter as `retain` is dropped. If none remain, nothing is written. The default cap is 5. If Ollama is down, `reflect` throws and writes nothing.
+Gathering keeps facts that score at least half as high as the best match, so an off-topic fact is not sent to the model. A draft is dropped when it cites a fact outside that set, cites only one fact while several were gathered, hedges (`suggesting`, `indicating`), or comments on the notes (`separate from`, `mentioned in the context of`). Near-duplicate wording is collapsed and the higher confidence is kept. The same junk filter as `retain` still applies. If none remain, nothing is written. The default cap is 5. If Ollama is down, `reflect` throws and writes nothing.
 
-The default chat model is `qwen3:8b`. `host` is the Ollama base URL.
+The default chat model is `qwen3:8b`. `host` is the Ollama base URL. The HTTP timeout defaults to 120 seconds (`timeoutMs`, or `--timeout-ms` on the CLI) so a cold model load can finish. The live test allows the same 120 seconds.
 
 ```ts
 const reflected = await bank.reflect({
