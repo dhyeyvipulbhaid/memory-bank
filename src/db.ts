@@ -2,6 +2,7 @@ import { Database } from "bun:sqlite";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { dedupeIdenticalFacts } from "./dedupe.ts";
+import { pruneOrphanObservations } from "./reflect.ts";
 import { migrateSchema, SCHEMA_SQL } from "./schema.ts";
 
 export function openDatabase(path: string): Database {
@@ -15,6 +16,7 @@ export function openDatabase(path: string): Database {
   db.exec("PRAGMA busy_timeout = 5000;");
   db.exec(SCHEMA_SQL);
   migrateSchema(db);
+  pruneOrphanObservations(db);
   dedupeIdenticalFacts(db);
   return db;
 }

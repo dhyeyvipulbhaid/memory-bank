@@ -49,4 +49,5 @@ test.skipIf(process.env.MEMORY_BANK_OLLAMA_TEST !== "1")(
     expect(hybrid.facts[0]?.breakdown.keyword).toBe(0);
     bank.close();
   },
+  { timeout: 120_000 },
 );
