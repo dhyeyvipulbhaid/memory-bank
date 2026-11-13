@@ -15,13 +15,17 @@ interface FactRow {
   occurrence_time: string | null;
   mentioned_at: string;
   created_at: string;
+  embedding: Uint8Array | null;
+  embedding_model: string | null;
+  embedding_dim: number | null;
 }
 
 /** Keep the oldest fact for each normalized text in a bank and drop the copies. */
 export function dedupeIdenticalFacts(db: Database): void {
   const rows = db
     .query(
-      `SELECT id, bank_id, text, occurrence_time, mentioned_at, created_at
+      `SELECT id, bank_id, text, occurrence_time, mentioned_at, created_at,
+              embedding, embedding_model, embedding_dim
        FROM facts`,
     )
     .all() as FactRow[];
@@ -62,6 +66,16 @@ export function dedupeIdenticalFacts(db: Database): void {
              SET occurrence_time = ?
              WHERE id = ? AND bank_id = ? AND occurrence_time IS NULL`,
           ).run(filled.occurrence_time, keeper.id, keeper.bank_id);
+        }
+      }
+      if (keeper.embedding == null) {
+        const donor = extras.find((row) => row.embedding != null && row.embedding_dim != null);
+        if (donor?.embedding) {
+          db.query(
+            `UPDATE facts
+             SET embedding = ?, embedding_model = ?, embedding_dim = ?
+             WHERE id = ? AND bank_id = ? AND embedding IS NULL`,
+          ).run(donor.embedding, donor.embedding_model, donor.embedding_dim, keeper.id, keeper.bank_id);
         }
       }
       for (const extra of extras) {
