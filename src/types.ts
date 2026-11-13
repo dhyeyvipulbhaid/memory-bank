@@ -286,6 +286,49 @@ export interface ForgetManyResult {
   removedEntityIds: string[];
 }
 
+export type GraphEdgeType = "semantic" | "temporal" | "entity" | "derived";
+
+export interface GraphSnapshotInput {
+  /** When set, must match this bank. The open bank is used otherwise. */
+  bankId?: string;
+  /** Most recent nodes to include. Defaults to 200. Hard cap 1000. */
+  limit?: number;
+  since?: string | Date;
+  until?: string | Date;
+  /** Cosine cutoff for a semantic edge. Defaults to 0.72. */
+  minSimilarity?: number;
+  /** Include reflect observations. Defaults to true. */
+  includeObservations?: boolean;
+  /** Clock for recency. Defaults to now. */
+  now?: string | Date;
+}
+
+export interface GraphNode {
+  id: string;
+  /** Truncated text for the label. */
+  label: string;
+  kind: FactKind | "observation";
+  mentionedAt: string;
+  occurrenceTime: string | null;
+  /** Cited facts for an observation, otherwise 1. Drives node size. */
+  sourceFactCount: number;
+  /** 1 is now, halving every 30 days. */
+  recency: number;
+  derived: boolean;
+}
+
+export interface GraphEdge {
+  source: string;
+  target: string;
+  type: GraphEdgeType;
+  weight: number;
+}
+
+export interface GraphSnapshot {
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+}
+
 export interface HybridRecallResult {
   facts: HybridFact[];
   /** Sum of estimateTokens(fact.text) for the facts returned. */

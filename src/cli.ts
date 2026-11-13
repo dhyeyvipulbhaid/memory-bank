@@ -1,4 +1,6 @@
 #!/usr/bin/env bun
+import { readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import {
   createOllamaEmbedder,
   createOllamaExtractor,
@@ -22,6 +24,8 @@ Usage:
   memory-bank sweep --db <file> [--bank <id>] [--apply]
   memory-bank list --db <file> --limit <n> [--offset <n>] [--kind world|experience] [--entity <name>] [--query <text>] [--bank <id>]
   memory-bank forget --db <file> --id <fact-id> [--bank <id>]
+  memory-bank graph --db <file> --out <graph.json> [--limit <n>] [--min-similarity <n>] [--since <iso>] [--until <iso>] [--no-observations] [--bank <id>]
+  memory-bank graph-serve --db <file> [--port <n>] [--limit <n>] [--min-similarity <n>] [--no-observations] [--bank <id>]
 
 retain calls a local Ollama server (default chat model qwen3:8b).
 remember and retain also embed with nomic-embed-text unless --no-embed is set.
@@ -30,7 +34,9 @@ hybrid fuses keyword, vector, and graph signals. It still answers if embedding i
 reflect asks Ollama (default qwen3:8b) for observations and writes nothing if that call fails.
 backfill embeds facts that have no vector yet.
 sweep lists stored junk. It deletes only with --apply. Back up the sqlite file first.
-list and forget page and remove facts. The SQLite file is plain local data.
+list and forget page and remove facts.
+graph writes a snapshot for the dev viewer. graph-serve opens it in a browser at 127.0.0.1.
+The SQLite file is plain local data.
 `;
 
 export async function main(argv: string[]): Promise<number> {
@@ -50,7 +56,9 @@ export async function main(argv: string[]): Promise<number> {
       command !== "reflect" &&
       command !== "sweep" &&
       command !== "list" &&
-      command !== "forget"
+      command !== "forget" &&
+      command !== "graph" &&
+      command !== "graph-serve"
     ) {
       console.error(`Unknown command: ${command}\n\n${USAGE}`);
       return 1;
@@ -151,6 +159,12 @@ export async function main(argv: string[]): Promise<number> {
     } else if (command === "forget") {
       const result = bank.forget(required(flags, "id"));
       console.log(JSON.stringify(result, null, 2));
+    } else if (command === "graph") {
+      const snapshot = graphOptions(bank, flags);
+      writeFileSync(required(flags, "out"), JSON.stringify(snapshot, null, 2));
+      console.log(JSON.stringify({ nodes: snapshot.nodes.length, edges: snapshot.edges.length }, null, 2));
+    } else if (command === "graph-serve") {
+      await serveGraph(bank, flags);
     } else {
       const result = await bank.backfillEmbeddings();
       console.log(JSON.stringify(result, null, 2));
@@ -177,7 +191,7 @@ function parseArgs(argv: string[]): { command: string; flags: Map<string, string
       continue;
     }
     const key = token.slice(2);
-    if (key === "no-embed" || key === "llm-rerank" || key === "apply") {
+    if (key === "no-embed" || key === "llm-rerank" || key === "apply" || key === "no-observations") {
       flags.set(key, "true");
       continue;
     }
@@ -224,6 +238,38 @@ function parseEntities(value: string | undefined): Array<{ name: string; type: E
     }
     return { name, type: type as EntityType };
   });
+}
+
+function graphOptions(bank: MemoryBank, flags: Map<string, string>) {
+  return bank.graphSnapshot({
+    limit: flags.has("limit") ? requireNumber(flags, "limit") : undefined,
+    since: flags.get("since"),
+    until: flags.get("until"),
+    minSimilarity: flags.has("min-similarity") ? requireNumber(flags, "min-similarity") : undefined,
+    includeObservations: !flags.has("no-observations"),
+  });
+}
+
+async function serveGraph(bank: MemoryBank, flags: Map<string, string>): Promise<void> {
+  const port = flags.has("port") ? requireNumber(flags, "port") : 4173;
+  const htmlPath = join(import.meta.dir, "../tools/graph-viewer/index.html");
+  const html = readFileSync(htmlPath);
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port,
+    fetch(request) {
+      const url = new URL(request.url);
+      if (url.pathname === "/graph.json") {
+        return Response.json(graphOptions(bank, flags));
+      }
+      if (url.pathname === "/" || url.pathname === "/index.html") {
+        return new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } });
+      }
+      return new Response("Not found", { status: 404 });
+    },
+  });
+  console.error(`Memory graph at http://127.0.0.1:${server.port}`);
+  await new Promise(() => {});
 }
 
 if (import.meta.main) {

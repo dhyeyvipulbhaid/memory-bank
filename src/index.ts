@@ -14,6 +14,7 @@ export { DEFAULT_HALF_LIFE_DAYS, DEFAULT_HYBRID_WEIGHTS, DEFAULT_RRF_K } from ".
 export { createOllamaReranker, type OllamaRerankerOptions } from "./rerank.ts";
 export { createFakeReflector, createOllamaReflector, type FakeReflect, type OllamaReflectorOptions } from "./reflector.ts";
 export { junkReason, type JunkReason } from "./knowledge-gap.ts";
+export { DEFAULT_GRAPH_LIMIT, DEFAULT_MIN_SIMILARITY, MAX_GRAPH_LIMIT } from "./graph.ts";
 export { createFakeExtractor, type FakeScript } from "./extract/fake.ts";
 export {
   createOllamaExtractor,
@@ -32,6 +33,11 @@ export type {
   FactKind,
   FactRecord,
   ForgetManyResult,
+  GraphEdge,
+  GraphEdgeType,
+  GraphNode,
+  GraphSnapshot,
+  GraphSnapshotInput,
   HybridFact,
   HybridRecallInput,
   HybridRecallResult,
