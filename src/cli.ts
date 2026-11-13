@@ -2,6 +2,7 @@
 import {
   createOllamaEmbedder,
   createOllamaExtractor,
+  createOllamaReflector,
   createOllamaReranker,
   openBank,
   type EntityType,
@@ -16,12 +17,14 @@ Usage:
   memory-bank remember --db <file> --text <text> [--kind world|experience] [--entities Name:type,...] [--occurrence-time <iso>] [--mentioned-at <iso>] [--bank <id>] [--embed-model <name>] [--host <url>] [--timeout-ms <n>] [--no-embed]
   memory-bank recall --db <file> --query <text> --token-budget <n> [--bank <id>]
   memory-bank hybrid --db <file> --query <text> --token-budget <n> [--bank <id>] [--embed-model <name>] [--host <url>] [--half-life-days <n>] [--llm-rerank] [--no-embed]
+  memory-bank reflect --db <file> [--query <text>] [--entity <name>] [--topic <text>] [--since <iso>] [--until <iso>] [--max <n>] [--bank <id>] [--model <name>] [--host <url>] [--timeout-ms <n>] [--no-embed]
   memory-bank backfill --db <file> [--bank <id>] [--embed-model <name>] [--host <url>] [--timeout-ms <n>]
 
 retain calls a local Ollama server (default chat model qwen3:8b).
 remember and retain also embed with nomic-embed-text unless --no-embed is set.
 If embedding fails, the fact is still stored. recall does not use a model.
 hybrid fuses keyword, vector, and graph signals. It still answers if embedding is down.
+reflect asks Ollama (default qwen3:8b) for observations and writes nothing if that call fails.
 backfill embeds facts that have no vector yet. The SQLite file is plain local data.
 `;
 
@@ -38,7 +41,8 @@ export async function main(argv: string[]): Promise<number> {
       command !== "remember" &&
       command !== "recall" &&
       command !== "backfill" &&
-      command !== "hybrid"
+      command !== "hybrid" &&
+      command !== "reflect"
     ) {
       console.error(`Unknown command: ${command}\n\n${USAGE}`);
       return 1;
@@ -47,7 +51,7 @@ export async function main(argv: string[]): Promise<number> {
     const db = required(flags, "db");
     const embed =
       command === "backfill" ||
-      (command === "hybrid" && !flags.has("no-embed")) ||
+      ((command === "hybrid" || command === "reflect") && !flags.has("no-embed")) ||
       ((command === "retain" || command === "remember") && !flags.has("no-embed"));
     bank = openBank(db, {
       bankId: flags.get("bank"),
@@ -73,6 +77,14 @@ export async function main(argv: string[]): Promise<number> {
             timeoutMs: flags.has("timeout-ms") ? requireNumber(flags, "timeout-ms") : undefined,
           })
         : undefined,
+      reflector:
+        command === "reflect"
+          ? createOllamaReflector({
+              model: flags.get("model"),
+              host: flags.get("host"),
+              timeoutMs: flags.has("timeout-ms") ? requireNumber(flags, "timeout-ms") : undefined,
+            })
+          : undefined,
     });
 
     if (command === "retain") {
@@ -104,6 +116,16 @@ export async function main(argv: string[]): Promise<number> {
         tokenBudget: requireNumber(flags, "token-budget"),
         halfLifeDays: flags.has("half-life-days") ? requireNumber(flags, "half-life-days") : undefined,
         llmRerank: flags.has("llm-rerank"),
+      });
+      console.log(JSON.stringify(result, null, 2));
+    } else if (command === "reflect") {
+      const result = await bank.reflect({
+        query: flags.get("query"),
+        entity: flags.get("entity"),
+        topic: flags.get("topic"),
+        since: flags.get("since"),
+        until: flags.get("until"),
+        maxObservations: flags.has("max") ? requireNumber(flags, "max") : undefined,
       });
       console.log(JSON.stringify(result, null, 2));
     } else {

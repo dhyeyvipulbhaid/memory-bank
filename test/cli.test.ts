@@ -239,6 +239,44 @@ test("hybrid recall from the CLI finds a keyword fact without an embedder", asyn
   expect(body.facts[0]?.breakdown.vector).toBe(0);
 });
 
+test("reflect against a closed port writes nothing", async () => {
+  const db = join(tempDir(), "memory.sqlite");
+  const saved = await run([
+    "remember",
+    "--no-embed",
+    "--db",
+    db,
+    "--text",
+    "Maya prefers morning meetings.",
+    "--mentioned-at",
+    "2024-08-01T00:00:00.000Z",
+  ]);
+  expect(saved.code).toBe(0);
+
+  const reflected = await run([
+    "reflect",
+    "--no-embed",
+    "--db",
+    db,
+    "--query",
+    "Maya",
+    "--host",
+    "http://127.0.0.1:9",
+    "--timeout-ms",
+    "500",
+  ]);
+  expect(reflected.code).toBe(1);
+  expect(reflected.stderr.toLowerCase()).toContain("ollama");
+
+  const sqlite = new Database(db, { readonly: true });
+  try {
+    expect(sqlite.query("SELECT id FROM observations").all()).toEqual([]);
+    expect(sqlite.query("SELECT id FROM facts").all()).toHaveLength(1);
+  } finally {
+    sqlite.close();
+  }
+});
+
 test("missing command prints usage", async () => {
   const result = await run([]);
   expect(result.code).toBe(1);

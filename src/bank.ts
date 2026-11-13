@@ -3,7 +3,7 @@ import { chunkText } from "./chunk.ts";
 import { openDatabase } from "./db.ts";
 import { normalizeFactText } from "./dedupe.ts";
 import { createBruteForceCosineRanker, prepareEmbedding } from "./embed.ts";
-import { EmbedderUnavailableError, MemoryBankError } from "./errors.ts";
+import { EmbedderUnavailableError, MemoryBankError, ReflectFailedError, ReflectorUnavailableError } from "./errors.ts";
 import { normalizeExtractedFacts } from "./extract/validate.ts";
 import {
   DEFAULT_HALF_LIFE_DAYS,
@@ -13,6 +13,8 @@ import {
   rankHybridFacts,
 } from "./hybrid.ts";
 import { isAssistantKnowledgeGap } from "./knowledge-gap.ts";
+import { acceptObservations, MAX_OBSERVATIONS, pruneOrphanObservations, saveObservations, scopeKey } from "./reflect.ts";
+import { createOllamaReflector } from "./reflector.ts";
 import { recallFacts } from "./recall.ts";
 import { createOllamaReranker, reorderByIds } from "./rerank.ts";
 import { assertEntityType, resolveMentions, type Mention } from "./resolve.ts";
@@ -33,6 +35,9 @@ import {
   type RetainResult,
   type HybridRecallInput,
   type HybridRecallResult,
+  type ReflectInput,
+  type Reflector,
+  type ReflectResult,
   type Reranker,
   type SemanticSearchInput,
   type VectorRanker,
@@ -49,6 +54,7 @@ export class MemoryBank {
     private readonly embedder: Embedder | undefined,
     private readonly ranker: VectorRanker,
     private readonly reranker: Reranker | undefined,
+    private readonly reflector: Reflector | undefined,
   ) {}
 
   async retain(input: RetainInput): Promise<RetainResult> {
@@ -199,6 +205,7 @@ export class MemoryBank {
       queryVector,
       vectorModel: this.embedder?.model ?? null,
       ranker: this.ranker,
+      includeObservations: input.includeObservations !== false,
     });
 
     if (input.llmRerank && ranked.length > 1) {
@@ -215,6 +222,150 @@ export class MemoryBank {
     }
 
     return packHybridFacts(ranked, input.tokenBudget, input.limit);
+  }
+
+  /**
+   * Ask the reflector for a few observations about the gathered facts.
+   * Re-running the same scope updates a matching observation and drops the
+   * ones the model no longer returns. Ollama being down throws and writes nothing.
+   */
+  async reflect(input: ReflectInput = {}): Promise<ReflectResult> {
+    this.assertOpen();
+    const maxObservations = input.maxObservations ?? MAX_OBSERVATIONS;
+    if (!Number.isInteger(maxObservations) || maxObservations < 1) {
+      throw new MemoryBankError("maxObservations must be an integer of 1 or more.");
+    }
+    const since = input.since == null ? undefined : toIso(input.since, "null");
+    const until = input.until == null ? undefined : toIso(input.until, "null");
+    const gathered = await this.gatherFacts(input, since, until);
+    if (gathered.length === 0) {
+      throw new ReflectFailedError("reflect found no facts in that scope. Nothing was written.");
+    }
+    const reflector = this.reflector ?? createOllamaReflector();
+    let drafts: Awaited<ReturnType<Reflector["reflect"]>>;
+    try {
+      drafts = await reflector.reflect({
+        topic: input.topic ?? input.entity ?? input.query,
+        facts: gathered.map((fact) => ({
+          id: fact.id,
+          text: fact.text,
+          kind: fact.kind,
+          mentionedAt: fact.mentionedAt,
+        })),
+      });
+    } catch (error) {
+      if (error instanceof MemoryBankError) throw error;
+      throw new ReflectorUnavailableError("Reflect failed. Nothing was written.", { cause: error });
+    }
+    const accepted = acceptObservations(
+      drafts,
+      new Set(gathered.map((fact) => fact.id)),
+      maxObservations,
+    );
+    const vectors = new Map<string, Awaited<ReturnType<MemoryBank["vectorFor"]>>>();
+    for (const draft of accepted) {
+      vectors.set(normalizeFactText(draft.text), await this.vectorFor(draft.text));
+    }
+    const now = new Date().toISOString();
+    return saveObservations(
+      this.db,
+      this.bankId,
+      scopeKey({
+        query: input.query,
+        entity: input.entity,
+        topic: input.topic,
+        since,
+        until,
+      }),
+      accepted,
+      vectors,
+      now,
+    );
+  }
+
+  /** Remove one fact. Observations that cited only that fact are removed too. */
+  forget(factId: string): { removedObservationIds: string[] } {
+    this.assertOpen();
+    if (typeof factId !== "string" || factId.trim() === "") {
+      throw new MemoryBankError("factId must be a non-empty string.");
+    }
+    const write = this.db.transaction(() => {
+      const existing = this.db
+        .query("SELECT id FROM facts WHERE id = ? AND bank_id = ?")
+        .get(factId, this.bankId) as { id: string } | null;
+      if (!existing) throw new MemoryBankError("No fact with that id is in this bank.");
+      this.db.query("DELETE FROM edges WHERE fact_id = ? AND bank_id = ?").run(factId, this.bankId);
+      this.db
+        .query("DELETE FROM observation_sources WHERE fact_id = ? AND bank_id = ?")
+        .run(factId, this.bankId);
+      this.db.query("DELETE FROM facts WHERE id = ? AND bank_id = ?").run(factId, this.bankId);
+      return { removedObservationIds: pruneOrphanObservations(this.db, this.bankId) };
+    });
+    return write();
+  }
+
+  private async gatherFacts(
+    input: ReflectInput,
+    since: string | undefined,
+    until: string | undefined,
+  ): Promise<Array<{ id: string; text: string; kind: string; mentionedAt: string; occurrenceTime: string | null }>> {
+    const query = [input.query, input.topic, input.entity]
+      .filter((part): part is string => typeof part === "string" && part.trim() !== "")
+      .join(" ");
+    const sinceMs = since == null ? null : Date.parse(since);
+    const untilMs = until == null ? null : Date.parse(until);
+    let rows: Array<{ id: string; text: string; kind: string; mentionedAt: string; occurrenceTime: string | null }> =
+      [];
+    if (query !== "") {
+      const recalled = await this.hybridRecall({
+        query,
+        tokenBudget: 4000,
+        limit: 40,
+        includeObservations: false,
+        now: input.now,
+      });
+      rows = recalled.facts
+        .filter((fact) => !fact.derived)
+        .map((fact) => ({
+          id: fact.id,
+          text: fact.text,
+          kind: fact.kind,
+          mentionedAt: fact.mentionedAt,
+          occurrenceTime: fact.occurrenceTime,
+        }));
+    } else {
+      rows = (
+        this.db
+          .query(
+            `SELECT id, text, kind, occurrence_time, mentioned_at
+             FROM facts
+             WHERE bank_id = ?
+             ORDER BY mentioned_at DESC
+             LIMIT 40`,
+          )
+          .all(this.bankId) as Array<{
+          id: string;
+          text: string;
+          kind: string;
+          occurrence_time: string | null;
+          mentioned_at: string;
+        }>
+      ).map((row) => ({
+        id: row.id,
+        text: row.text,
+        kind: row.kind,
+        mentionedAt: row.mentioned_at,
+        occurrenceTime: row.occurrence_time,
+      }));
+    }
+    if (sinceMs == null && untilMs == null) return rows;
+    return rows.filter((row) => {
+      const ms = Date.parse(row.occurrenceTime ?? row.mentionedAt);
+      if (Number.isNaN(ms)) return false;
+      if (sinceMs != null && ms < sinceMs) return false;
+      if (untilMs != null && ms >= untilMs) return false;
+      return true;
+    });
   }
 
   async semanticSearch(input: SemanticSearchInput): Promise<RecallResult> {
@@ -361,6 +512,7 @@ export function openBank(path: string, options: OpenBankOptions = {}): MemoryBan
     options.embedder ?? undefined,
     options.vectorRanker ?? createBruteForceCosineRanker(),
     options.reranker ?? undefined,
+    options.reflector ?? undefined,
   );
 }
 

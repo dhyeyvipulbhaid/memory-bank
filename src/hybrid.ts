@@ -37,6 +37,7 @@ export interface HybridRankOptions {
   queryVector: Float32Array | null;
   vectorModel: string | null;
   ranker: VectorRanker;
+  includeObservations: boolean;
 }
 
 interface FactRow {
@@ -49,6 +50,9 @@ interface FactRow {
   embedding: unknown;
   embedding_model: string | null;
   embedding_dim: number | null;
+  derived: boolean;
+  confidence: number | null;
+  sourceFactIds: string[];
 }
 
 interface LinkRow {
@@ -75,14 +79,7 @@ export function rankHybridFacts(db: Database, bankId: string, options: HybridRan
     return [];
   }
 
-  const facts = db
-    .query(
-      `SELECT id, text, kind, occurrence_time, mentioned_at, source_id,
-              embedding, embedding_model, embedding_dim
-       FROM facts
-       WHERE bank_id = ?`,
-    )
-    .all(bankId) as FactRow[];
+  const facts = loadMemoryRows(db, bankId, options.includeObservations);
   if (facts.length === 0) return [];
 
   const links = loadLinks(db, bankId);
@@ -120,11 +117,14 @@ export function rankHybridFacts(db: Database, bankId: string, options: HybridRan
     ranked.push({
       id: fact.id,
       text: fact.text,
-      kind: fact.kind as FactKind,
+      kind: fact.derived ? "observation" : (fact.kind as FactKind),
       occurrenceTime: fact.occurrence_time,
       mentionedAt: fact.mentioned_at,
       sourceId: fact.source_id,
       entities,
+      derived: fact.derived,
+      sourceFactIds: fact.derived ? fact.sourceFactIds : undefined,
+      confidence: fact.confidence ?? undefined,
       score: (fusion + prior) * recency,
       breakdown: {
         keyword: part.keyword,
@@ -158,6 +158,71 @@ export function packHybridFacts(
     tokensUsed += cost;
   }
   return { facts: selected, tokensUsed };
+}
+
+function loadMemoryRows(db: Database, bankId: string, includeObservations: boolean): FactRow[] {
+  const stored = db
+    .query(
+      `SELECT id, text, kind, occurrence_time, mentioned_at, source_id,
+              embedding, embedding_model, embedding_dim
+       FROM facts
+       WHERE bank_id = ?`,
+    )
+    .all(bankId) as Array<Omit<FactRow, "derived" | "confidence" | "sourceFactIds">>;
+  const facts: FactRow[] = stored.map((row) => ({
+    ...row,
+    derived: false,
+    confidence: null,
+    sourceFactIds: [],
+  }));
+  if (!includeObservations) return facts;
+
+  const observations = db
+    .query(
+      `SELECT id, text, confidence, updated_at, embedding, embedding_model, embedding_dim
+       FROM observations
+       WHERE bank_id = ?`,
+    )
+    .all(bankId) as Array<{
+    id: string;
+    text: string;
+    confidence: number;
+    updated_at: string;
+    embedding: unknown;
+    embedding_model: string | null;
+    embedding_dim: number | null;
+  }>;
+  const links = db
+    .query(
+      `SELECT observation_id, fact_id
+       FROM observation_sources
+       WHERE bank_id = ?
+       ORDER BY fact_id`,
+    )
+    .all(bankId) as Array<{ observation_id: string; fact_id: string }>;
+  const sources = new Map<string, string[]>();
+  for (const link of links) {
+    const list = sources.get(link.observation_id) ?? [];
+    list.push(link.fact_id);
+    sources.set(link.observation_id, list);
+  }
+  for (const observation of observations) {
+    facts.push({
+      id: observation.id,
+      text: observation.text,
+      kind: "observation",
+      occurrence_time: null,
+      mentioned_at: observation.updated_at,
+      source_id: observation.id,
+      embedding: observation.embedding,
+      embedding_model: observation.embedding_model,
+      embedding_dim: observation.embedding_dim,
+      derived: true,
+      confidence: observation.confidence,
+      sourceFactIds: sources.get(observation.id) ?? [],
+    });
+  }
+  return facts;
 }
 
 function keywordScores(facts: readonly FactRow[], tokens: readonly string[]): Map<string, number> {
